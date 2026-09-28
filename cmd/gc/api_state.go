@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -35,6 +36,7 @@ import (
 	"github.com/gastownhall/gascity/internal/orderdiscovery"
 	"github.com/gastownhall/gascity/internal/orderdispatch"
 	"github.com/gastownhall/gascity/internal/orders"
+	"github.com/gastownhall/gascity/internal/packman"
 	"github.com/gastownhall/gascity/internal/pathutil"
 	"github.com/gastownhall/gascity/internal/rig"
 	"github.com/gastownhall/gascity/internal/rollout"
@@ -54,7 +56,7 @@ import (
 const cacheReconcileActor = "cache-reconcile"
 
 // controllerState implements api.State, api.StateMutator, and
-// api.ConfigWriteSerializer.
+// api.ConfigWriteSerializer (as a config transaction).
 // Protected by an RWMutex for hot-reload: readers take RLock,
 // the controller loop takes Lock when updating cfg/sp/stores.
 type controllerState struct {
@@ -119,6 +121,14 @@ type controllerState struct {
 	// until the loop observes and applies the same or a newer on-disk config.
 	configMutationPending atomic.Bool
 	pendingConfigRev      string
+
+	// configTransactionMu fences multi-file config writes (API pack import
+	// add/remove and rig provisioning) from their first file write through
+	// controller publication. The runtime reload only TryLocks it around its
+	// candidate load, so it never reads a half-written generation and never
+	// stalls the reconciler behind a slow import. Lock order: this mutex, then
+	// the configedit.Editor lock.
+	configTransactionMu sync.Mutex
 
 	// rolloutFlags is the boot-latched rollout-gate snapshot: written once in
 	// newControllerState, never reassigned (reads are lock-free by construction,
@@ -445,6 +455,11 @@ func (cs *controllerState) openRigStore(provider, rigName, rigPath, prefix strin
 		s.SetEnv(env)
 		return s, nil
 	}
+	// One bd opener for both the fallback store and the proxied split store's
+	// write leaf: a demotion must not change which store does the writing.
+	openBd := func() (beads.Store, error) {
+		return bdStoreForRig(scopeRoot, cs.cityPath, cfg, prefix), nil
+	}
 	result, err := controllerStateOpenRigStoreAtForCity(context.Background(), beads.StoreOpenOptions{
 		ScopeRoot:                   scopeRoot,
 		CityPath:                    cs.cityPath,
@@ -452,6 +467,10 @@ func (cs *controllerState) openRigStore(provider, rigName, rigPath, prefix strin
 		PreflightChecker:            newBeadsPreflightChecker(cs.cityPath, provider),
 		ConditionalWrites:           cs.rolloutFlags.BeadsConditionalWrites(),
 		OnConditionalWritesDegraded: conditionalWritesDegradedRecorder(cs.eventProv, cs.rolloutFlags, "rig/"+rigName),
+		// The controller holds a rig store for the process lifetime, which is
+		// what decides both the project-pool shape and whether a finite-idle
+		// proxy may host it at all.
+		LongLived: true,
 		OpenFileStore: func() (beads.Store, error) {
 			store, err := openCompatibleFileStore(scopeRoot, cs.cityPath)
 			if err != nil {
@@ -459,10 +478,9 @@ func (cs *controllerState) openRigStore(provider, rigName, rigPath, prefix strin
 			}
 			return store, nil
 		},
-		OpenBdStore: func() (beads.Store, error) {
-			return bdStoreForRig(scopeRoot, cs.cityPath, cfg, prefix), nil
-		},
-		OpenExecStore: openExecStore,
+		OpenBdStore:      openBd,
+		OpenProxiedStore: proxiedNativeStoreOpenerForScope(cs.cityPath, scopeRoot, cfg, openBd),
+		OpenExecStore:    openExecStore,
 		OpenNativeStore: func() (beads.Store, error) {
 			env, err := nativeDoltOpenEnvForScope(cs.cityPath, cfg, scopeRoot)
 			if err != nil {
@@ -766,8 +784,19 @@ func (cs *controllerState) applyBeadEventToStores(evt events.Event) {
 	if len(evt.Payload) == 0 {
 		return
 	}
+	// Route, autoclose, and poke under the same identity the caches apply the
+	// payload under. A subject that names a different bead than the payload
+	// would deliver one bead's snapshot to another bead's store and run
+	// autoclose for the wrong bead, so such an event is dropped; the next
+	// reconcile repairs whatever it would have refreshed.
+	id, err := beads.BeadEventID(evt.Subject, evt.Payload)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "api: bead event watcher: dropping %s seq=%d: %v\n", evt.Type, evt.Seq, err) //nolint:errcheck // best-effort stderr
+		return
+	}
+	evt.Subject = id
 	cs.mu.RLock()
-	stores := cs.beadEventStoresLocked(evt)
+	stores := cs.beadEventStoresLocked(id)
 	var storeRef string
 	if evt.Type == events.BeadClosed {
 		storeRef = cs.autocloseStoreRefLocked(evt.Subject)
@@ -851,8 +880,11 @@ func (cs *controllerState) runBeadCloseAutoclose(beadID string, store beads.Stor
 	})
 }
 
-func (cs *controllerState) beadEventStoresLocked(evt events.Event) []beads.Store {
-	if id := beadEventID(evt); id != "" && cs.cfg != nil {
+// beadEventStoresLocked returns the stores a bead event for id is applied to:
+// the store whose configured prefix owns id, or every store when no configured
+// prefix does. id must already be canonical (see beads.BeadEventID).
+func (cs *controllerState) beadEventStoresLocked(id string) []beads.Store {
+	if id != "" && cs.cfg != nil {
 		if store, known := cs.beadEventConfiguredStoreLocked(id); known {
 			if store == nil {
 				return nil
@@ -919,19 +951,6 @@ func (cs *controllerState) beadEventConfiguredStoreLocked(id string) (beads.Stor
 		}
 	}
 	return matchedStore, matchedLen >= 0
-}
-
-func beadEventID(evt events.Event) string {
-	id := strings.TrimSpace(evt.Subject)
-	if id == "" {
-		var payload struct {
-			ID string `json:"id"`
-		}
-		if err := json.Unmarshal(evt.Payload, &payload); err == nil {
-			id = strings.TrimSpace(payload.ID)
-		}
-	}
-	return id
 }
 
 // update replaces the config, session provider, and reopens stores.
@@ -1068,32 +1087,51 @@ func storePointerKey(store beads.Store) (uintptr, bool) {
 	return value.Pointer(), true
 }
 
-func (cs *controllerState) updateFromRuntime(cfg *config.City, sp runtime.Provider, revision string) {
+// updateFromRuntime publishes a runtime reload candidate to the API-visible
+// snapshot. It reports false when the candidate is stale (a newer API mutation
+// or on-disk config won while the reload was preparing it) and leaves the
+// controller state untouched; the caller must then keep its own generation too.
+func (cs *controllerState) updateFromRuntime(cfg *config.City, sp runtime.Provider, revision string) bool {
 	if cs.configMutationPending.Load() {
 		matchesPending, stale := cs.runtimeUpdateStatusForPendingMutation(revision)
 		if stale {
-			return
+			return false
 		}
 		if matchesPending {
 			if cs.runtimeUpdateDropsPendingRigs(cfg) {
-				return
+				return false
 			}
 			if cs.runtimeUpdateCanReuseCurrentStores(cfg) {
 				cs.updateConfigAndProviderOnly(cfg, sp)
 				cs.clearConfigMutationPending()
-				return
+				return true
 			}
 		}
 	} else if cs.runtimeUpdateRevisionIsStale(revision) {
-		return
+		return false
 	}
 	if cs.runtimeUpdateCanReuseCurrentStores(cfg) {
 		cs.updateConfigAndProviderOnly(cfg, sp)
 		cs.clearConfigMutationPending()
-		return
+		return true
 	}
 	cs.update(cfg, sp)
 	cs.clearConfigMutationPending()
+	return true
+}
+
+// runtimeUpdateWouldBeAccepted is the read-only half of updateFromRuntime.
+// Reload checks it before irreversible provider-swap work; updateFromRuntime
+// repeats the check at publication to close races during that work.
+func (cs *controllerState) runtimeUpdateWouldBeAccepted(cfg *config.City, revision string) bool {
+	if cs.configMutationPending.Load() {
+		matchesPending, stale := cs.runtimeUpdateStatusForPendingMutation(revision)
+		if stale {
+			return false
+		}
+		return !matchesPending || !cs.runtimeUpdateDropsPendingRigs(cfg)
+	}
+	return !cs.runtimeUpdateRevisionIsStale(revision)
 }
 
 func (cs *controllerState) updateConfigAndProviderOnly(cfg *config.City, sp runtime.Provider) {
@@ -1789,14 +1827,58 @@ func (cs *controllerState) DisableOrder(name, rig string) error {
 	})
 }
 
-// SerializeConfigWrite runs fn under the same per-city mutation lock the
-// configedit.Editor uses for agent/rig/provider/formula edits. The HTTP pack
-// import add/remove handlers write pack.toml, packs.lock, and sometimes
-// city.toml outside the Editor callback shape, so routing them through this
-// shared lock keeps concurrent config writers from interleaving and losing an
-// update or desyncing the manifest and lockfile.
+// SerializeConfigWrite runs a multi-file pack import write (pack.toml,
+// packs.lock, and sometimes city.toml) as one config transaction:
+//
+//   - it holds the config transaction fence, so the runtime reload cannot read
+//     the generation while it is half-written, and the configedit.Editor lock,
+//     so it serializes with every other API config mutation;
+//   - if fn fails after writing some of the files, the pack files are restored,
+//     so a half-written pack set never stays on disk for a later reload;
+//   - on success the generation is published to the controller state (refresh,
+//     pending mark, poke) exactly like mutateAndPoke, and rolled back if it does
+//     not load.
 func (cs *controllerState) SerializeConfigWrite(fn func() error) error {
+	return cs.withConfigTransaction(func() error {
+		var packFiles *configMutationSnapshot
+		if cs.cityPath != "" {
+			var err error
+			packFiles, err = capturePackFilesSnapshot(cs.cityPath)
+			if err != nil {
+				return fmt.Errorf("snapshotting pack config files: %w", err)
+			}
+		}
+		return cs.mutateAndPoke(func() error {
+			err := fn()
+			if err != nil && packFiles != nil {
+				if restoreErr := packFiles.restore(); restoreErr != nil {
+					return errors.Join(err, fmt.Errorf("restoring pack config files: %w", restoreErr))
+				}
+			}
+			return err
+		})
+	})
+}
+
+// withConfigTransaction runs fn holding the config transaction fence and the
+// configedit.Editor lock. fn must not call Editor methods that take the
+// Editor lock themselves.
+func (cs *controllerState) withConfigTransaction(fn func() error) error {
+	cs.configTransactionMu.Lock()
+	defer cs.configTransactionMu.Unlock()
 	return cs.editor.Do(fn)
+}
+
+// tryWithConfigTransactionIdle runs fn only when no config transaction is in
+// flight and reports whether it ran. The runtime reload uses it for its
+// candidate load so it neither reads a half-written generation nor blocks.
+func (cs *controllerState) tryWithConfigTransactionIdle(fn func()) bool {
+	if !cs.configTransactionMu.TryLock() {
+		return false
+	}
+	defer cs.configTransactionMu.Unlock()
+	fn()
+	return true
 }
 
 var _ api.ConfigWriteSerializer = (*controllerState)(nil)
@@ -2056,9 +2138,10 @@ func realPathForContainment(target string) (string, error) {
 // rolls back through Provision's own topology snapshot (mutateAndPoke returns
 // the mutate error without touching its config snapshot), while a post-write
 // refresh failure rolls back through mutateAndPoke's config snapshot. The two
-// restore layers never overlap. The whole handshake runs under
-// SerializeConfigWrite so a concurrent config edit cannot interleave with
-// Provision's read-modify-append of city.toml.
+// restore layers never overlap. The whole handshake runs under the config
+// transaction (withConfigTransaction) so a concurrent config edit cannot
+// interleave with Provision's read-modify-append of city.toml, and the runtime
+// reload cannot read the rig's half-written files.
 func (cs *controllerState) CreateRig(r config.Rig) error {
 	rigPath := strings.TrimSpace(r.Path)
 	if rigPath == "" {
@@ -2424,7 +2507,7 @@ func (cs *controllerState) sweepOrphanRigProvisions(ctx context.Context) error {
 }
 
 // provisionRigLocked runs the config-write half of a rig add under the per-city
-// guard (SerializeConfigWrite → mutateAndPoke). r.Path must already be resolved
+// guard (withConfigTransaction → mutateAndPoke). r.Path must already be resolved
 // absolute. onStep, when non-nil, wires rig.Deps.OnStep so the caller can
 // project provisioning progress onto events; nil onStep produces the exact
 // git-blind behavior CreateRig has always had. It returns the provisioned rig.
@@ -2443,7 +2526,7 @@ func (cs *controllerState) provisionRigLocked(r config.Rig, onStep func(step, de
 	}
 
 	var provisionedRig config.Rig
-	if err := cs.SerializeConfigWrite(func() error {
+	if err := cs.withConfigTransaction(func() error {
 		return cs.mutateAndPoke(func() error {
 			var err error
 			provisionedRig, err = cs.provisionRigWrite(r, depOnStep)
@@ -2483,7 +2566,7 @@ func rigConfigHasRigNamed(cfg *config.City, name string) bool {
 }
 
 // provisionRigWrite performs the config-mutating half of a git_url rig add. It
-// MUST run inside cs.SerializeConfigWrite → cs.mutateAndPoke (the per-city write
+// MUST run inside cs.withConfigTransaction → cs.mutateAndPoke (the per-city write
 // lock plus refresh/poke): it loads the raw for-edit config, re-asserts the
 // duplicate-name guard authoritatively under the lock, registers the city dolt
 // config for the beads-init path, and runs rig.Provision. A best-effort
@@ -2777,34 +2860,8 @@ func (cs *controllerState) DeleteProviderPatch(name string) error {
 }
 
 func captureConfigMutationSnapshot(cityPath string) (*configMutationSnapshot, error) {
-	snapshot := &configMutationSnapshot{
-		cityPath: cityPath,
-		files:    make(map[string][]byte),
-		existed:  make(map[string]bool),
-	}
-
-	capture := func(path string) error {
-		// Snapshot at the resolved symlink target: restore writes with a
-		// temp-file + rename, and renaming over the unresolved path would
-		// replace a symlinked config with a regular file (the ga-lurp5d
-		// failure mode). Resolve-only — restores write the original bytes
-		// back, so the key-loss rewrite guard does not apply.
-		path, err := fsys.ResolveSymlinks(fsys.OSFS{}, path)
-		if err != nil {
-			return err
-		}
-		data, err := os.ReadFile(path)
-		switch {
-		case err == nil:
-			snapshot.files[path] = data
-			snapshot.existed[path] = true
-		case os.IsNotExist(err):
-			snapshot.existed[path] = false
-		default:
-			return fmt.Errorf("reading %s: %w", path, err)
-		}
-		return nil
-	}
+	snapshot := newConfigMutationSnapshot(cityPath)
+	capture := snapshot.captureFile
 
 	cityToml, err := cityTomlRollbackPath(fsys.OSFS{}, cityPath)
 	if err != nil {
@@ -2814,6 +2871,8 @@ func captureConfigMutationSnapshot(cityPath string) (*configMutationSnapshot, er
 	for _, path := range []string{
 		cityToml,
 		filepath.Join(cityPath, ".gc", "site.toml"),
+		filepath.Join(cityPath, "pack.toml"),
+		filepath.Join(cityPath, packman.LockfileName),
 	} {
 		if err := capture(path); err != nil {
 			return nil, err
@@ -2863,6 +2922,54 @@ func captureConfigMutationSnapshot(cityPath string) (*configMutationSnapshot, er
 	return snapshot, nil
 }
 
+func newConfigMutationSnapshot(cityPath string) *configMutationSnapshot {
+	return &configMutationSnapshot{
+		cityPath: cityPath,
+		files:    make(map[string][]byte),
+		existed:  make(map[string]bool),
+	}
+}
+
+// captureFile records path's bytes (or its absence) for restore.
+func (s *configMutationSnapshot) captureFile(path string) error {
+	// Snapshot at the resolved symlink target: restore writes with a
+	// temp-file + rename, and renaming over the unresolved path would
+	// replace a symlinked config with a regular file (the ga-lurp5d
+	// failure mode). Resolve-only — restores write the original bytes
+	// back, so the key-loss rewrite guard does not apply.
+	path, err := fsys.ResolveSymlinks(fsys.OSFS{}, path)
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		s.files[path] = data
+		s.existed[path] = true
+	case os.IsNotExist(err):
+		s.existed[path] = false
+	default:
+		return fmt.Errorf("reading %s: %w", path, err)
+	}
+	return nil
+}
+
+// capturePackFilesSnapshot records the files a pack import add/remove may
+// write: pack.toml, packs.lock, and city.toml (for city-level [imports]).
+func capturePackFilesSnapshot(cityPath string) (*configMutationSnapshot, error) {
+	snapshot := newConfigMutationSnapshot(cityPath)
+	for _, path := range []string{
+		filepath.Join(cityPath, "city.toml"),
+		filepath.Join(cityPath, "pack.toml"),
+		filepath.Join(cityPath, packman.LockfileName),
+	} {
+		if err := snapshot.captureFile(path); err != nil {
+			return nil, err
+		}
+	}
+	return snapshot, nil
+}
+
 func (s *configMutationSnapshot) restore() error {
 	var restoreErr error
 
@@ -2877,6 +2984,11 @@ func (s *configMutationSnapshot) restore() error {
 			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 				restoreErr = errors.Join(restoreErr, fmt.Errorf("removing %s: %w", path, err))
 			}
+			continue
+		}
+		if current, err := os.ReadFile(path); err == nil && bytes.Equal(current, s.files[path]) {
+			// Unchanged: rewriting would only churn mtimes and wake the
+			// config watcher for a no-op reload.
 			continue
 		}
 		if err := fsys.WriteFileAtomic(fsys.OSFS{}, path, s.files[path], 0o644); err != nil {

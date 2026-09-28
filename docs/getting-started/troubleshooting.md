@@ -90,6 +90,51 @@ per-city `.gc/system/packs` tree, adds the missing pinned import(s) to
 `pack.toml`, and refreshes `packs.lock` and the cache. Leftover
 `.gc/system/packs` directories on disk are pruned automatically.
 
+## `gascity-pack-binding` Doctor Warning
+
+Cities created by gc v1.4.x import the public Gas City pack under the key
+`gascity`:
+
+```toml
+[imports.gascity]
+source = "https://github.com/gastownhall/gascity-packs/tree/main/gascity"
+```
+
+The import key namespaces the pack's commands and skills, and the pack
+ecosystem is written against `gc`: the pack documents skill `gc.mayor`, and
+role prompts in Gas City pack releases after 0.1.6 run `gc gc claim`. Under
+`[imports.gascity]` that command is `gc gascity claim`, so role workers fail
+their first claim once the pack is bumped past 0.1.6. Current `gc init` writes
+`[imports.gc]`.
+
+`gc doctor` reports this as a warning; the city keeps working at the pinned
+0.1.6 pack. Run:
+
+```bash
+gc doctor --fix
+```
+
+The `gascity-pack-binding` check renames the key to `[imports.gc]` in
+`pack.toml` (or in a city.toml root `[imports]` override), keeping the source,
+version, and every other field. `packs.lock` is keyed by source, so no
+reinstall is needed. The check identifies the pack by its source (any https,
+http, or SSH spelling of `gastownhall/gascity-packs` with the `gascity` pack
+directory), not by the key name, so a fork or a different pack bound as
+`gascity` is left alone, and it never
+touches rig imports or `[defaults.rig.imports]`.
+
+The fix changes nothing and explains why when:
+
+- `[imports.gc]` already imports a different pack. Rename one of the imports
+  by hand.
+- `[imports.gc]` already imports the Gas City pack with a different version or
+  settings. Remove one of the two imports by hand. An exact duplicate (same
+  source and version) is removed automatically.
+- A string value in `pack.toml` or `city.toml` is shaped like a
+  `gascity.`-qualified name, for example a patch targeting `gascity.<agent>`.
+  The message names the file and key. Update the value to `gc.` and rerun, or
+  rename the import by hand if the value is unrelated. Comments are ignored.
+
 ## "command not found" After Install
 
 If `gc` is installed but your shell cannot find it, the binary is not on your
@@ -505,19 +550,21 @@ same kind of hard error — delegation is a systemd contract.
 
 ## JSONL Archive Push Failures
 
-The core pack runs `jsonl-export` every 15 minutes to dump each bead
-database to a text-diffable JSONL snapshot inside a local git repository
-(the "JSONL archive"). The archive serves as a disaster-recovery backup:
-if the live Dolt server loses data, the last-known-good bead graph can be
-reconstructed from the archive's commit history.
+The core pack runs `jsonl-export` every 15 minutes to export each bead
+store (the city and every rig) with `bd export` into a text-diffable JSONL
+snapshot inside a local git repository (the "JSONL archive"): one issue per
+line, with its labels, dependencies and comments. The archive serves as a
+disaster-recovery backup: a snapshot from any commit restores with
+`gc bd import <file>`.
 
 `jsonl-export` (every 15 minutes) and `reaper` (every 30 minutes) ship in
 the core pack, so they are active in every city by default — including
 cities that previously ran them only via the opt-in gastown maintenance
-pack. On cities without a Dolt target (for example `[beads]
-provider = "file"`), both orders skip with a one-line `no managed dolt
-target for this city` message instead of running. To turn them off
-entirely, skip them by name in `city.toml`:
+pack. Both reach every bead store through `gc bd`, so they work the same on
+bd-owned proxied, gc-managed and mixed cities. On cities whose beads
+provider is not bd (for example `[beads] provider = "file"`), both orders
+skip with a one-line message and an `order.skipped` event instead of
+running. To turn them off entirely, skip them by name in `city.toml`:
 
 ```toml
 [orders]

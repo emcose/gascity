@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
@@ -377,5 +378,19 @@ func TestRuntimeRegistryACPCapturesUnderCityTranscripts(t *testing.T) {
 func TestACPProviderConfigLeavesCaptureToTheCaller(t *testing.T) {
 	if got := acpProviderConfig(config.ACPSessionConfig{}).TranscriptRoot; got != "" {
 		t.Fatalf("acpProviderConfig TranscriptRoot = %q, want empty", got)
+	}
+}
+
+func TestRuntimeRegistryACPConfigCarriesStopGrace(t *testing.T) {
+	got := acpProviderConfig(config.ACPSessionConfig{StopGrace: "45s"})
+	if got.StopGrace != 45*time.Second {
+		t.Errorf("acp StopGrace = %v, want 45s from [session.acp] stop_grace", got.StopGrace)
+	}
+	def := acpProviderConfig(config.ACPSessionConfig{})
+	if def.StopGrace != runtime.ManagedProcessStopGrace {
+		t.Errorf("default acp StopGrace = %v, want runtime.ManagedProcessStopGrace (%v)", def.StopGrace, runtime.ManagedProcessStopGrace)
+	}
+	if def.HandshakeTimeout != 30*time.Second || def.NudgeBusyTimeout != 60*time.Second || def.OutputBufferLines != 1000 {
+		t.Errorf("default acp config = %+v, want 30s handshake, 60s nudge busy, 1000 buffer lines", def)
 	}
 }

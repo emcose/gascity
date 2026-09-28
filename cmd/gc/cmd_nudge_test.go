@@ -5656,21 +5656,28 @@ func (s *countingNudgeStore) CloseStore() error {
 	return nil
 }
 
-// installCountingNudgeStoreSeam swaps openNudgeBeadStore for a fake that hands
-// out a fresh countingNudgeStore over a single shared MemStore on every call
-// (mirroring the deployed binary, where each per-tick open resolves to the same
-// backing native store). It returns pointers to the open and close counters and
-// restores the original seam via t.Cleanup. Tests using it must stay serial.
+// installCountingNudgeStoreSeam swaps openOwnedNudgeBeadStore for a fake that
+// hands out a fresh countingNudgeStore over a single shared MemStore on every
+// call (mirroring the deployed binary, where each per-tick open resolves to the
+// same backing native store). It returns pointers to the open and close counters
+// and restores the original seam via t.Cleanup. Tests using it must stay serial.
+//
+// It replaces the OWNING seam, not openNudgeBeadStore, because that is the one
+// the closing frames call and openNudgeBeadStore delegates to it — so both forms
+// move together and the counters cannot miss an open. The fake returns the same
+// store as both the class store and the opened handle, which is the unrelocated
+// shape: a frame that closes the handle closes the store the counter watches.
 func installCountingNudgeStoreSeam(t *testing.T) (opens, closes *int) {
 	t.Helper()
 	backing := beads.NewMemStore()
 	var openCount, closeCount int
-	prev := openNudgeBeadStore
-	openNudgeBeadStore = func(string) beads.NudgesStore {
+	prev := openOwnedNudgeBeadStore
+	openOwnedNudgeBeadStore = func(string) (beads.NudgesStore, beads.Store) {
 		openCount++
-		return beads.NudgesStore{Store: &countingNudgeStore{MemStore: backing, closes: &closeCount}}
+		store := &countingNudgeStore{MemStore: backing, closes: &closeCount}
+		return beads.NudgesStore{Store: store}, store
 	}
-	t.Cleanup(func() { openNudgeBeadStore = prev })
+	t.Cleanup(func() { openOwnedNudgeBeadStore = prev })
 	return &openCount, &closeCount
 }
 
@@ -6189,4 +6196,177 @@ func TestResolveNudgePollInterval(t *testing.T) {
 			t.Fatalf("resolveNudgePollInterval = %v, want default %v", got, defaultNudgePollInterval)
 		}
 	})
+}
+
+// setupNudgeDrainInjectFastPathCity stands up a file-beads city whose
+// GC_CITY_PATH names it and whose hook identity is GC_ALIAS=worker, with the
+// nudge target store seam counting opens (every resolveNudgeTarget opens it).
+func setupNudgeDrainInjectFastPathCity(t *testing.T) (cityDir string, targetOpens *int) {
+	t.Helper()
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_INJECT_CONTEXT", "")
+	cityDir = t.TempDir()
+	writeNamedSessionCityTOML(t, cityDir)
+	t.Setenv("GC_CITY_PATH", cityDir)
+	t.Setenv("GC_ALIAS", "worker")
+
+	previous := openNudgeBeadStore
+	opens := 0
+	openNudgeBeadStore = func(string) beads.NudgesStore {
+		opens++
+		return beads.NudgesStore{}
+	}
+	t.Cleanup(func() { openNudgeBeadStore = previous })
+	return cityDir, &opens
+}
+
+// withNudgeDrainHookStdin feeds payload to the drain as the provider hook's
+// piped stdin for the duration of the test.
+func withNudgeDrainHookStdin(t *testing.T, payload []byte) {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	previous := os.Stdin
+	os.Stdin = r
+	t.Cleanup(func() {
+		os.Stdin = previous
+		_ = r.Close()
+	})
+}
+
+// With nothing queued and no context-usage sample, the hook context the drain
+// writes cannot depend on the target, so it must not resolve one.
+func TestCmdNudgeDrainInjectEmptyQueueSkipsTargetResolution(t *testing.T) {
+	_, targetOpens := setupNudgeDrainInjectFastPathCity(t)
+	withNudgeDrainHookStdin(t, []byte(`{"hook_event_name":"UserPromptSubmit"}`))
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdNudgeDrainWithFormat(nil, true, "", &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdNudgeDrainWithFormat = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if *targetOpens != 0 {
+		t.Fatalf("nudge target store opens = %d, want 0 for an empty queue", *targetOpens)
+	}
+	if !strings.Contains(stdout.String(), "Current time:") {
+		t.Fatalf("stdout = %q, want the hook clock context", stdout.String())
+	}
+}
+
+// Anything the target could change keeps the full resolution path: queued or
+// unreadable queue state, a usage sample the agent's advisory policy renders,
+// a step reminder (written only once the target resolves), or a scope that the
+// explicit city environment alone does not decide.
+func TestCmdNudgeDrainInjectFallsBackToTargetResolution(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, cityDir string)
+		// wantAbsent must not appear in stdout: the full path writes the step
+		// reminder only for a resolved target, and this seam never resolves.
+		wantAbsent string
+	}{
+		{
+			name: "queued nudge for another session",
+			setup: func(t *testing.T, cityDir string) {
+				t.Helper()
+				if err := withNudgeQueueState(cityDir, func(state *nudgeQueueState) error {
+					state.Pending = []queuedNudge{{ID: "nudge-other", Agent: "other"}}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "dead-lettered nudge",
+			setup: func(t *testing.T, cityDir string) {
+				t.Helper()
+				if err := withNudgeQueueState(cityDir, func(state *nudgeQueueState) error {
+					state.Dead = []queuedNudge{{ID: "nudge-dead", Agent: "worker"}}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "unreadable queue",
+			setup: func(t *testing.T, cityDir string) {
+				t.Helper()
+				writeCorruptNudgeQueueState(t, cityDir)
+			},
+		},
+		{
+			name: "context usage sample",
+			setup: func(t *testing.T, _ string) {
+				t.Helper()
+				transcript := writeTranscript(t, usageLine("claude-fable-5", 10_000, 100_000, 10_000))
+				withNudgeDrainHookStdin(t, hookInputFor(transcript))
+			},
+		},
+		{
+			name: "active step reminder",
+			setup: func(t *testing.T, cityDir string) {
+				t.Helper()
+				store, err := openCityStoreAt(cityDir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				created, err := store.Create(beads.Bead{
+					Title:       "Fast path step",
+					Description: "do the fast path step",
+					Type:        "task",
+					Assignee:    "worker",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				status := "in_progress"
+				if err := store.Update(created.ID, beads.UpdateOpts{Status: &status}); err != nil {
+					t.Fatal(err)
+				}
+				if got := wispStepInjectionContent(cityDir); !strings.Contains(got, "do the fast path step") {
+					t.Fatalf("step reminder fixture = %q, want the in-progress step", got)
+				}
+			},
+			wantAbsent: "do the fast path step",
+		},
+		{
+			name: "explicit city flag",
+			setup: func(t *testing.T, cityDir string) {
+				t.Helper()
+				previous := cityFlag
+				cityFlag = cityDir
+				t.Cleanup(func() { cityFlag = previous })
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cityDir, targetOpens := setupNudgeDrainInjectFastPathCity(t)
+			tc.setup(t, cityDir)
+
+			var stdout, stderr bytes.Buffer
+			if code := cmdNudgeDrainWithFormat(nil, true, "", &stdout, &stderr); code != 0 {
+				t.Fatalf("cmdNudgeDrainWithFormat = %d, want fail-open 0; stderr=%s", code, stderr.String())
+			}
+			if *targetOpens != 1 {
+				t.Fatalf("nudge target store opens = %d, want 1 (full target resolution)", *targetOpens)
+			}
+			if !strings.Contains(stdout.String(), "Current time:") {
+				t.Fatalf("stdout = %q, want the hook clock context", stdout.String())
+			}
+			if tc.wantAbsent != "" && strings.Contains(stdout.String(), tc.wantAbsent) {
+				t.Fatalf("stdout = %q, want no %q for an unresolved target", stdout.String(), tc.wantAbsent)
+			}
+		})
+	}
 }

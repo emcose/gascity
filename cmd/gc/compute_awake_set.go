@@ -66,6 +66,7 @@ type AwakeSessionBead struct {
 	ExplicitWake              bool      // explicit durable wake request is pending
 	DependencyOnly            bool      // only wakeable via dependency gate
 	NamedIdentity             string    // non-empty for named session beads
+	Alias                     string    // stable alias the session claims work under; "" for a rebinding pool slot
 	ConfiguredNamedSession    bool      // configured_named_session metadata is true
 	Pinned                    bool      // pin_awake durable wake reason
 	Drained                   bool      // state=="drained" or sleep_reason=="drained"
@@ -109,6 +110,9 @@ type AwakeDecision struct {
 	// use it to persist currently_processing_bead_id and to detect when an
 	// alive session has been reassigned to a different bead.
 	AssignedWorkBeadID string
+	// AssignedWorkClaimed distinguishes an in-progress claim from ready open
+	// work. Destructive idle recovery must never recycle a live claim holder.
+	AssignedWorkClaimed bool
 	// RequiresFreshCycle is true when an alive session's recorded
 	// currently_processing_bead_id differs from AssignedWorkBeadID. The
 	// reconciler combines this with wake_mode=fresh to trigger a
@@ -414,6 +418,15 @@ func ComputeAwakeSet(input AwakeInput) map[string]AwakeDecision {
 		}
 		if hasAssignedWork {
 			decision.AssignedWorkBeadID = anchor
+			for _, work := range input.WorkBeads {
+				if work.Status != "in_progress" {
+					continue
+				}
+				if sessionAssigneeMatches(input.NamedSessions, bead, strings.TrimSpace(work.Assignee)) {
+					decision.AssignedWorkClaimed = true
+					break
+				}
+			}
 			if bead.CurrentlyProcessingBeadID != "" && anchor != bead.CurrentlyProcessingBeadID {
 				decision.RequiresFreshCycle = true
 			}
@@ -768,6 +781,13 @@ func sessionAssigneeMatches(named []AwakeNamedSession, bead AwakeSessionBead, as
 		return false
 	}
 	if assignee == bead.ID || assignee == bead.SessionName {
+		return true
+	}
+	// A session claims work under its alias first (session.AssigneeIdentifier),
+	// so a namepool member holding "rig/furiosa" work owns it. The bridge fills
+	// Alias only for stable aliases (stableAssignmentAliasForConfigInfo), never
+	// for a rebinding pool slot.
+	if bead.Alias != "" && assignee == bead.Alias {
 		return true
 	}
 	if bead.NamedIdentity != "" {

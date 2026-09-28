@@ -185,5 +185,6 @@ func acpProviderConfig(a config.ACPSessionConfig) sessionacp.Config {
 		HandshakeTimeout:  a.HandshakeTimeoutDuration(),
 		NudgeBusyTimeout:  a.NudgeBusyTimeoutDuration(),
 		OutputBufferLines: a.OutputBufferLinesOrDefault(),
+		StopGrace:         a.StopGraceDuration(),
 	}
 }
