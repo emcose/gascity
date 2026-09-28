@@ -196,6 +196,53 @@ func TestSQLiteStoreTxRetriesWholeTransactionOnBusy(t *testing.T) {
 	}
 }
 
+// TestCachingStoreTxRefreshesOnlyCommittedAttempt covers CachingStore.Tx over
+// a backing store that re-runs the callback after a busy failure: touched-id
+// tracking restarts each attempt, so only the committed attempt's ids are
+// refreshed into the cache. Refreshing the rolled-back attempt's id would find
+// nothing in the backing store and mark it dirty as a cache problem.
+func TestCachingStoreTxRefreshesOnlyCommittedAttempt(t *testing.T) {
+	store := openSQLiteStoreForTest(t, t.TempDir())
+	cache := NewCachingStoreForTest(store, nil)
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+
+	calls := 0
+	var ids []string
+	err := cache.Tx("retry through cache", func(tx Tx) error {
+		calls++
+		b, err := tx.Create(Bead{Title: fmt.Sprintf("attempt %d", calls)})
+		if err != nil {
+			return err
+		}
+		ids = append(ids, b.ID)
+		if calls == 1 {
+			return fmt.Errorf("clearing claim fence for %q: database is locked (517)", b.ID)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Tx: %v", err)
+	}
+	if calls != 2 || len(ids) != 2 {
+		t.Fatalf("callback ran %d times minting %v, want 2", calls, ids)
+	}
+
+	if got, err := cache.cachedGetOnly(ids[1]); err != nil || got.Title != "attempt 2" {
+		t.Fatalf("cachedGetOnly(%s) = %+v, %v; want the committed attempt", ids[1], got, err)
+	}
+	if _, err := cache.cachedGetOnly(ids[0]); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cachedGetOnly(%s) from the rolled-back attempt = %v, want ErrNotFound", ids[0], err)
+	}
+	if _, err := cache.Get(ids[0]); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get(%s) from the rolled-back attempt = %v, want ErrNotFound", ids[0], err)
+	}
+	if stats := cache.Stats(); stats.ProblemCount != 0 {
+		t.Fatalf("cache recorded %d problems (last: %s), want 0", stats.ProblemCount, stats.LastProblem)
+	}
+}
+
 func TestSQLiteStoreWriterDSNBeginsImmediate(t *testing.T) {
 	path := filepath.Join("/city/.gc/store/graph", sqliteStoreFilename)
 	cases := []struct {
