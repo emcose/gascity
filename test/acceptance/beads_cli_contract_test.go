@@ -33,38 +33,26 @@ func runBD(t *testing.T, dir string, args ...string) (string, error) {
 	bdPath := helpers.RequireBD(t)
 	cmd := exec.Command(bdPath, args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "BEADS_DIR="+filepath.Join(dir, ".beads"))
+	// Pin HOME to dir itself, alongside BEADS_DIR, so bd's home-scoped config
+	// lookup ($HOME/.beads/config.yaml) can never diverge from the
+	// BEADS_DIR-scoped one this test drives — a shared-server config.yaml
+	// sitting in the ambient real HOME (a real fleet-host condition, not
+	// hypothetical; first surfaced as ga-yoxtux) can otherwise make bd route
+	// through that shared server instead of dir's own store. Regression-
+	// tested directly by TestRunBDIsolatesHOMEFromSharedServerConfig, kept in
+	// a sibling file (beads_cli_contract_home_isolation_test.go) rather than
+	// here so this file's test list stays exactly the focused external
+	// contract manifest pinned by
+	// TestAcceptanceTargetsSeparateTierAFromExternalBdContracts
+	// (scripts/ci_critical_path_test.go). The identical append(os.Environ(),
+	// ..., "HOME="+dir) last-value-wins isolation is separately regression-
+	// tested, generically, for the sibling call site bdLatestSchemaVersion by
+	// helpers.TestBdLatestSchemaVersionIsolatesHOMEFromSharedServerConfig
+	// (test/acceptance/helpers/bd_schema_parity_test.go), which has no
+	// acceptance build tag and so runs as part of the ordinary fast suite.
+	cmd.Env = append(os.Environ(), "BEADS_DIR="+filepath.Join(dir, ".beads"), "HOME="+dir)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
-}
-
-// TestRunBDIsolatesHOMEFromSharedServerConfig proves runBD does not leak
-// the ambient HOME into the bd subprocess it execs. runBD builds cmd.Env
-// from os.Environ() with no HOME isolation of its own, so a shared-server
-// config.yaml sitting in the real $HOME can make bd route through that
-// shared server instead of dir's own BEADS_DIR-scoped store.
-func TestRunBDIsolatesHOMEFromSharedServerConfig(t *testing.T) {
-	helpers.RequireBD(t)
-
-	pollutedHome := t.TempDir()
-	beadsDir := filepath.Join(pollutedHome, ".beads")
-	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
-		t.Fatalf("creating polluted HOME .beads dir: %v", err)
-	}
-	cfg := "no-db: true\ndolt:\n    shared-server: true\n"
-	if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte(cfg), 0o644); err != nil {
-		t.Fatalf("writing polluted HOME config.yaml: %v", err)
-	}
-	t.Setenv("HOME", pollutedHome)
-
-	dir := t.TempDir()
-	requireBD(t, dir, "init", "-p", "ct", "--skip-hooks", "-q")
-	id := createBead(t, dir, "home-isolation probe")
-
-	out := requireBD(t, dir, "list", "--json")
-	if !strings.Contains(out, id) {
-		t.Fatalf("bd list under a shared-server HOME did not see bead %s created in dir's own BEADS_DIR-scoped store:\n%s", id, out)
-	}
 }
 
 // requireBD runs a bd command and fails the test if it returns non-zero.

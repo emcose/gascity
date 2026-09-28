@@ -81,6 +81,14 @@ func bdRunWithEnv(t *testing.T, bdPath, dir string, extraEnv map[string]string, 
 	cmd := exec.Command(bdPath, args...)
 	cmd.Dir = dir
 	cmd.Env = os.Environ()
+	// Pin HOME to dir itself so bd's home-scoped config lookup
+	// ($HOME/.beads/config.yaml) can never diverge from its directory-scoped
+	// one (dir/.beads/config.yaml, written by bd init below) — a shared-server
+	// config.yaml sitting in the ambient real HOME (a real fleet-host
+	// condition, not hypothetical) can otherwise make bd route through that
+	// shared server instead of dir's own local store. See
+	// TestBdRunWithEnvIsolatesHOMEFromSharedServerConfig.
+	cmd.Env = append(cmd.Env, "HOME="+dir)
 	for k, v := range extraEnv {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}

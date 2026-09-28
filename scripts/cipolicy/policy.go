@@ -82,7 +82,19 @@ const (
 	// TestBeadsProxiedIgnoresUserLevelSharedServer (-timeout 15m) and its job
 	// cap moves 90 -> 105 minutes to keep the step budget under it. Reviewed
 	// delta: one test step and the cap, no new job, trigger or permission.
-	expectedCIExecutionHash     = "10f31160f31aa60e705a2098ae2722ec82e4fd14dc76895800b8d0acab486416"
+	//
+	// Bumped again (ga-nr9epw, restoring ga-1037rg / ga-yoxtux regression
+	// coverage without re-widening test-bd-cli-contract's own -run regex,
+	// which TestAcceptanceTargetsSeparateTierAFromExternalBdContracts pins as
+	// an exact literal substring): one new step, "bd CLI contract HOME
+	// isolation (...)", added immediately after the existing "bd CLI contract
+	// (...)" step in each of contract-acceptance-previous, contract-
+	// acceptance-current and contract-radar-bd-head. Each new step runs `make
+	// test-bd-cli-contract-home-isolation`, a separate Makefile target driving
+	// only TestRunBDIsolatesHOMEFromSharedServerConfig under the same
+	// acceptance_bd_contract tag and bd binary the preceding step already
+	// resolved onto PATH. No new job, trigger or permission.
+	expectedCIExecutionHash     = "4cfc3092a43d4752b3d033404f0ed2ffb691722b9ca491ede99cc135c77618db"
 	expectedNightlyTriggersHash = "0a4400a09ac567e90adf8be1232eef1f14e36efd8dba3e143aa6e36f5b7a36f5"
 	// Nightly: reviewed delta Beads v1.3.0-rc.2 -> v1.3.0, then (round3 review,
 	// completeness) one new job, beads-proxied-perf: ubuntu-latest,
