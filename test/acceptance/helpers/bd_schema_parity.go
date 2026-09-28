@@ -93,6 +93,13 @@ func bdLatestSchemaVersion(bdPath string) (int, error) {
 
 	cmd := exec.CommandContext(ctx, bdPath, "migrate", "schema", "--db", filepath.Join(dir, "probe.db")) //nolint:gosec // caller-supplied test binary
 	cmd.Dir = dir
+	// Pin HOME to the probe's own throwaway dir (last entry wins per Cmd.Env's
+	// duplicate-key rule). Without this, bd fully inherits the ambient HOME,
+	// and on a host whose ~/.beads/config.yaml sets dolt.shared-server: true
+	// bd resolves the migration against that shared server instead of the
+	// explicit --db path above, surfacing that server's real state (or its
+	// absence) instead of a clean migration of the throwaway file (ga-wapfnm).
+	cmd.Env = append(os.Environ(), "HOME="+dir)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return 0, fmt.Errorf("bd schema probe: %s migrate schema: %w\n%s", bdPath, err, out)
