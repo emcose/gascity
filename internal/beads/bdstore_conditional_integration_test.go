@@ -203,17 +203,23 @@ func newConditionalIntegrationBdStore(t *testing.T) (*beads.BdStore, string) {
 }
 
 // newConditionalIntegrationRunner pins BEADS_DIR to the scope so every bd
-// invocation resolves the scope-local embedded database, and force-clears the
+// invocation resolves the scope-local embedded database, force-clears the
 // dolt-server env knobs: a dev shell with BEADS_DOLT_SERVER_HOST/PORT (a live
 // deployment's dolt server) or BEADS_DOLT_AUTO_START=1 exported must never make
 // this row write a tst database into a live server or leave a dolt sql-server
-// running in the TempDir. (CI's packages shard runs under env -i and is safe
-// either way; this guards local runs.)
+// running in the TempDir (CI's packages shard runs under env -i and is safe
+// either way; this guards local runs), and pins HOME to the same scope dir:
+// ExecCommandRunnerWithEnv only overlays the listed keys onto the inherited
+// environment, so an ambient HOME whose .beads/config.yaml sets
+// dolt.shared-server: true (this host's real config) would otherwise route
+// every bd call in this scope to that shared server instead of the scope's
+// own embedded database (ga-wapfnm).
 func newConditionalIntegrationRunner(scopeDir string) beads.CommandRunner {
 	return beads.ExecCommandRunnerWithEnv(map[string]string{
 		"BEADS_DIR":              filepath.Join(scopeDir, ".beads"),
 		"BEADS_DOLT_AUTO_START":  "0",
 		"BEADS_DOLT_SERVER_HOST": "",
 		"BEADS_DOLT_SERVER_PORT": "",
+		"HOME":                   scopeDir,
 	})
 }
