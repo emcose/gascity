@@ -176,6 +176,45 @@ func TestReadACPCaptureToolResultContentRules(t *testing.T) {
 				}
 			},
 		},
+		// The naming arm of the same restart-mid-tool-call shape: no
+		// announcing tool_call reached this process, so the result block's
+		// name comes from the terminal update through toolCall's own
+		// title/kind/"tool" chain. The three rows below pin each link;
+		// reverting the fallback to a bare &acpToolState{} turns all three
+		// red and nothing else in the package.
+		{
+			name: "an unannounced tool call is named from the update title",
+			updates: []string{
+				`{"sessionUpdate":"tool_call_update","toolCallId":"t1","title":"Edit x.go","kind":"edit","status":"completed","content":[{"type":"content","content":{"type":"text","text":"done"}}]}`,
+			},
+			check: func(t *testing.T, block ContentBlock) {
+				if block.Name != "Edit x.go" {
+					t.Errorf("tool name = %q, want the update's title", block.Name)
+				}
+			},
+		},
+		{
+			name: "an unannounced tool call with no title falls back to its kind",
+			updates: []string{
+				`{"sessionUpdate":"tool_call_update","toolCallId":"t1","kind":"edit","status":"completed","content":[{"type":"content","content":{"type":"text","text":"done"}}]}`,
+			},
+			check: func(t *testing.T, block ContentBlock) {
+				if block.Name != "edit" {
+					t.Errorf("tool name = %q, want the update's kind", block.Name)
+				}
+			},
+		},
+		{
+			name: "an unannounced tool call with neither title nor kind is named tool",
+			updates: []string{
+				`{"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"completed","content":[{"type":"content","content":{"type":"text","text":"done"}}]}`,
+			},
+			check: func(t *testing.T, block ContentBlock) {
+				if block.Name != "tool" {
+					t.Errorf("tool name = %q, want the %q default", block.Name, "tool")
+				}
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -303,6 +342,87 @@ func TestReadACPCapturePartialRun(t *testing.T) {
 	}
 }
 
+// A run open at EOF is partial whether or not a gc prompt is outstanding.
+// Both shapes here open a run with none in flight, so gating on the prompt
+// streamed them truncated under an id that never settles.
+func TestReadACPCaptureRunOpenWithNoPromptInFlightIsPartial(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		lines []string
+		text  string
+	}{
+		{
+			// update() admits a user_message_chunk run only when no prompt is
+			// in flight, so this run can never have one.
+			name: "user message chunk",
+			lines: []string{
+				acpHeaderLine("1"),
+				acpRecord("in", acpChunkMsg("user_message_chunk", "PART-ONE ")),
+			},
+			text: "PART-ONE ",
+		},
+		{
+			// The prompt's response cleared currentPrompt, then the agent kept
+			// streaming; this opens a fresh run with none outstanding.
+			name: "agent message chunk after end_turn",
+			lines: []string{
+				acpHeaderLine("1"),
+				acpRecord("out", acpPromptMsg("2", "go")),
+				acpRecord("in", acpChunkMsg("agent_message_chunk", "DONE")),
+				acpRecord("in", acpResultMsg("2", `{"stopReason":"end_turn"}`)),
+				acpRecord("in", acpChunkMsg("agent_message_chunk", "AFTER-")),
+			},
+			text: "AFTER-",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sess, err := ReadProviderFile("unreal-acp", writeACPCapture(t, joinLines(tc.lines...)), 0)
+			if err != nil {
+				t.Fatalf("ReadProviderFile: %v", err)
+			}
+			last := sess.Messages[len(sess.Messages)-1]
+			if acpEntryText(last) != tc.text {
+				t.Fatalf("last entry %q, want the open run %q", acpEntryText(last), tc.text)
+			}
+			if !last.Partial {
+				t.Errorf("open run %q partial=false, want partial", acpEntryText(last))
+			}
+			// Only the open run is partial; earlier entries already settled.
+			for _, entry := range sess.Messages[:len(sess.Messages)-1] {
+				if entry.Partial {
+					t.Errorf("settled entry %s is partial", entry.UUID)
+				}
+			}
+		})
+	}
+}
+
+// The withheld population that settledHistorySnapshot's doc block records: a
+// capture that stops growing with a run open never settles it, so repeated
+// reads of the same bytes keep reporting the trailing run partial.
+// TestReadACPCapturePartialRun is the contrast -- there the file grows and the
+// run settles on the next read.
+func TestReadACPCaptureQuiescedRunStaysPartialAcrossReads(t *testing.T) {
+	path := writeACPCapture(t, joinLines(
+		acpHeaderLine("1"),
+		acpRecord("out", acpPromptMsg("2", "go")),
+		acpRecord("in", acpChunkMsg("agent_message_chunk", "DONE")),
+		acpRecord("in", acpResultMsg("2", `{"stopReason":"end_turn"}`)),
+		acpRecord("in", acpChunkMsg("agent_message_chunk", "TAIL")),
+	))
+	for _, read := range []string{"first", "second"} {
+		sess, err := ReadProviderFile("unreal-acp", path, 0)
+		if err != nil {
+			t.Fatalf("%s read ReadProviderFile: %v", read, err)
+		}
+		last := sess.Messages[len(sess.Messages)-1]
+		if acpEntryText(last) != "TAIL" || !last.Partial {
+			t.Fatalf("%s read: trailing run %q partial=%v, want the post-end_turn run still held back",
+				read, acpEntryText(last), last.Partial)
+		}
+	}
+}
+
 func TestReadACPCaptureDropMarkers(t *testing.T) {
 	path := writeACPCapture(t, joinLines(
 		acpHeaderLine("1"),
@@ -326,5 +446,48 @@ func TestReadACPCaptureDropMarkers(t *testing.T) {
 	}
 	if meta.Activity != "" {
 		t.Errorf("activity = %q, want unknown after a drop marker", meta.Activity)
+	}
+}
+
+// The mirror of TestReadACPCaptureDropMarkers: the drop sits after the
+// response, so the gap can hide a newer prompt and the answered prompt the
+// backward scan reaches no longer proves the agent is idle. Both directions
+// need a pin, since fixing one while leaving the other unpinned is how the
+// asymmetry arose.
+func TestReadACPCaptureDropAfterResponseIsUnknown(t *testing.T) {
+	path := writeACPCapture(t, joinLines(
+		acpHeaderLine("1"),
+		acpRecord("out", acpPromptMsg("2", "go")),
+		acpRecord("in", acpChunkMsg("agent_message_chunk", "x")),
+		acpRecord("in", acpResultMsg("2", `{"stopReason":"end_turn"}`)),
+		`{"ts":"2026-09-25T10:00:04Z","dir":"meta","dropped":3}`,
+		acpUpdateRecord(`{"sessionUpdate":"available_commands_update","availableCommands":[]}`),
+	))
+	meta, err := ExtractTailMeta(path)
+	if err != nil {
+		t.Fatalf("ExtractTailMeta: %v", err)
+	}
+	if meta.Activity != "" {
+		t.Errorf("activity = %q, want unknown: the drop can hide a newer prompt", meta.Activity)
+	}
+}
+
+// The third decided exit of the backward scan. The two tests above both
+// reach the prompt arm; here the drop hides every prompt since the header,
+// so the scan runs out of records and lands on the header itself. Drops are
+// direction-blind, so this gap can hide the only prompt of the epoch just as
+// easily as a response, and the header cannot prove idleness across it.
+func TestReadACPCaptureDropBeforeAnyPromptIsUnknown(t *testing.T) {
+	path := writeACPCapture(t, joinLines(
+		acpHeaderLine("1"),
+		`{"ts":"2026-09-25T10:00:01Z","dir":"meta","dropped":2}`,
+		acpUpdateRecord(`{"sessionUpdate":"available_commands_update","availableCommands":[]}`),
+	))
+	meta, err := ExtractTailMeta(path)
+	if err != nil {
+		t.Fatalf("ExtractTailMeta: %v", err)
+	}
+	if meta.Activity != "" {
+		t.Errorf("activity = %q, want unknown: the drop can hide the only prompt", meta.Activity)
 	}
 }

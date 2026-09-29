@@ -326,6 +326,9 @@ func (r *acpCaptureReader) outgoing(lineIndex int, msg acpRPCMessage, raw json.R
 			Raw:       raw,
 		})
 	case msg.isResponse():
+		// Only a capture from a future writer reaches this branch: every
+		// caller of writeMessageCapturing is sendRequest or sendNotification,
+		// so gc's stdin path emits no JSON-RPC response today.
 		perm, ok := r.permissions[msg.idKey()]
 		if !ok {
 			return
@@ -531,8 +534,11 @@ func (r *acpCaptureReader) toolResult(lineIndex int, callID string, state *acpTo
 	r.closeRun()
 	current := state
 	if current == nil {
-		// An update for a tool call this process never announced.
-		current = &acpToolState{}
+		// An update for a tool call this process never announced (a restart
+		// mid-tool-call). Name it from the update itself, the same fallback
+		// toolCall uses, so the result block is not labeled with an empty
+		// name for exactly the records that are hardest to read.
+		current = &acpToolState{name: firstNonEmpty(kiroStringField(update, "title"), kiroStringField(update, "kind"), "tool")}
 		current.observe(update)
 	}
 	content := acpToolResultContent(current.content, current.rawOutput, update)
@@ -565,11 +571,14 @@ func (r *acpCaptureReader) permissionRequest(lineIndex int, msg acpRPCMessage, r
 	r.closeRun()
 	params := kiroRawObject(msg.Params)
 	toolCall := kiroRawObject(firstKiroRawField(params, "toolCall"))
-	// The interaction mirrors what the ACP runtime reports from Pending for
-	// the same request, so a client can match the transcript entry to the
-	// request it answers through /pending and /respond: the request id is
-	// derived from the JSON-RPC id, options are the option names in agent
-	// order, and the metadata lists each option's id and kind.
+	// The interaction carries the shape a runtime Pending report would use
+	// for the same request: the request id is derived from the JSON-RPC id,
+	// options are the option names in agent order, and the metadata lists
+	// each option's id and kind. That makes it forward-compatible with an ACP
+	// provider that implements Pending and Respond; it is not resolvable
+	// today, because both return runtime.ErrInteractionUnsupported (acp.go),
+	// so this approval renders as pending with no /pending or /respond round
+	// trip behind it.
 	requestID := acpPermissionRequestID(msg.ID)
 	metadata := map[string]string{"source": "acp"}
 	if callID := kiroStringField(toolCall, "toolCallId"); callID != "" {
@@ -704,9 +713,15 @@ func (r *acpCaptureReader) noteSessionID(id string) {
 }
 
 func (r *acpCaptureReader) finish(path string) *Session {
-	if r.run != nil && r.currentPrompt != "" {
-		// The agent is still streaming this message: later chunks will grow
-		// it in place under the same id.
+	if r.run != nil {
+		// A run still open at EOF may grow in place under the same id, so it
+		// is partial. Being open is the whole condition: every other record
+		// type closes the run before appending, so an open run is provably
+		// the last entry. Gating on an outstanding gc prompt as well would
+		// miss the two runs that open with none in flight, a
+		// user_message_chunk run (admitted only when len(prompts) == 0) and
+		// an agent_message_chunk run continuing past the prompt's response,
+		// and stream them truncated under an id that never settles.
 		r.run.entry.Partial = true
 	}
 	r.closeRun()
@@ -973,7 +988,17 @@ func acpCaptureActivity(lines [][]byte) (*TailMeta, bool) {
 		}
 		sawLine = true
 		if rec.isHeader() {
-			meta.Activity = "idle"
+			if sawDrop {
+				// Reaching the header means no prompt survives between it
+				// and the tail, and the scan runs backward, so a drop in
+				// that span has already been seen. Drops are indiscriminate,
+				// so the gap can hide the epoch's only prompt: the turn
+				// state is unknown here for the same reason it is in the
+				// prompt arm below.
+				meta.Activity = ""
+			} else {
+				meta.Activity = "idle"
+			}
 			return meta, true
 		}
 		switch {
@@ -983,12 +1008,14 @@ func acpCaptureActivity(lines [][]byte) (*TailMeta, bool) {
 			sawDrop = true
 		case rec.Dir == acpDirOut && msg.Method == acpMethodPrompt && msg.idKey() != "":
 			switch {
+			case sawDrop:
+				// The writer dropped records between this prompt and the
+				// tail, and drops are indiscriminate: the gap can hide this
+				// prompt's response or a newer prompt, so the turn state is
+				// unknown in both directions.
+				meta.Activity = ""
 			case answered[msg.idKey()]:
 				meta.Activity = "idle"
-			case sawDrop:
-				// The writer dropped records after this prompt; its response
-				// may be among them, so the turn state is unknown.
-				meta.Activity = ""
 			default:
 				meta.Activity = "in-turn"
 			}

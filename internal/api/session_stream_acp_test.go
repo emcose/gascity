@@ -144,6 +144,11 @@ func TestAgentOutputStreamHumaDeliversCompleteGrowingACPMessage(t *testing.T) {
 		defer mu.Unlock()
 		return append([]string(nil), texts...)
 	}
+	// Each send is the stream's own lifecycle signal, so waitFor blocks on it
+	// rather than sampling on a fixed interval. Buffered and coalescing: a send
+	// landing between waitFor's scan and its select still wakes the next wait
+	// instead of being lost.
+	sentSignal := make(chan struct{}, 1)
 	send := sse.Sender(func(msg sse.Message) error {
 		if resp, ok := msg.Data.(agentOutputResponse); ok {
 			mu.Lock()
@@ -151,21 +156,28 @@ func TestAgentOutputStreamHumaDeliversCompleteGrowingACPMessage(t *testing.T) {
 				texts = append(texts, turn.Role+":"+turn.Text)
 			}
 			mu.Unlock()
+			select {
+			case sentSignal <- struct{}{}:
+			default:
+			}
 		}
 		return nil
 	})
 	waitFor := func(want string) {
 		t.Helper()
-		deadline := time.Now().Add(3 * time.Second)
-		for time.Now().Before(deadline) {
+		deadline := time.After(3 * time.Second)
+		for {
 			for _, text := range sent() {
 				if strings.Contains(text, want) {
 					return
 				}
 			}
-			time.Sleep(10 * time.Millisecond)
+			select {
+			case <-sentSignal:
+			case <-deadline:
+				t.Fatalf("stream never sent %q; sent %q", want, sent())
+			}
 		}
-		t.Fatalf("stream never sent %q; sent %q", want, sent())
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

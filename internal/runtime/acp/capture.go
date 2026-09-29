@@ -28,7 +28,14 @@ import (
 // helper). Directories are 0700 and the file is 0600 because prompts and tool
 // output are sensitive. The file is opened in append mode: an agent restart
 // within one continuation epoch appends to the same file, and a session reset
-// (a new epoch) starts a new file. Files are never rotated or purged here.
+// (a new epoch) starts a new file.
+//
+// Nothing rotates or purges these files yet: not this writer, and not any
+// session-delete, city-teardown or doctor path. Capture is append-only and
+// deliberately owns no retention policy. Giving retention an owner (session
+// deletion removing <TranscriptRoot>/<session>/, plus an age or size cap) is
+// tracked by ga-pzbps. Until then a long-lived city accumulates
+// secret-bearing transcripts without bound.
 //
 // The file holds one JSON object per line:
 //
@@ -46,7 +53,12 @@ import (
 //     MCP server definitions hold env values, headers and URLs) is recorded
 //     as {"ts":…,"dir":"out","redacted":true,"msg":<message>}, where msg is
 //     the message re-encoded with runtime.RedactMCPServerConfigs applied. It
-//     is not the exact wire bytes; the id and method are unchanged.
+//     is not the exact wire bytes; the id and method are unchanged. The
+//     params are normalized as well as redacted: RedactMCPServerConfigs runs
+//     runtime.NormalizeMCPServerConfigs, which sorts mcpServers by
+//     name/transport/command/URL, while the wire message carries them in
+//     caller order. Do not read the recorded mcpServers order as the order
+//     the agent received.
 //   - After records were dropped because the writer fell behind:
 //     {"ts":…,"dir":"meta","dropped":N}, placed exactly where the gap is (and
 //     once more at close for drops that no later record followed).

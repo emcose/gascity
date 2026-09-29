@@ -11,6 +11,16 @@ import "github.com/gastownhall/gascity/internal/worker"
 // streaming chunks) would be sent truncated and never corrected, so these
 // streams hold it back until it settles. The structured stream upserts by
 // entry id and keeps partial entries.
+//
+// A transcript that stops growing with a run still open never settles it, so
+// these two streams withhold its last entry for the life of the live session.
+// An ACP capture marks any open chunk run partial, including a post-end_turn
+// agent run that may be the session's final record. Releasing such an entry
+// needs the quiescence signal only the consumer has -- the reader cannot tell
+// a dead file from a growing one, while handler_agent_output_stream.go
+// already tracks the transcript size across poll intervals -- so ga-xqv68
+// owns that. Closed-session snapshots and the structured stream are
+// unaffected.
 func settledHistorySnapshot(snapshot *worker.HistorySnapshot) *worker.HistorySnapshot {
 	if snapshot == nil {
 		return nil
