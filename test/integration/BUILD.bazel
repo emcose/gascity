@@ -3,6 +3,7 @@ load("@rules_go//go:def.bzl", "go_test")
 go_test(
     name = "integration_test",
     srcs = [
+        "bdstore_conformance_skip_test.go",
         "bead_id_test.go",
         "dolt_config_timeout_test.go",
         "testenv_import_test.go",
