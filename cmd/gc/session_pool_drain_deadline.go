@@ -22,11 +22,13 @@ import (
 //
 // Why a bound is needed at all: a session bead that enters drain and never
 // finalizes stays status=open forever, and an open session bead owns its
-// session_name. A pool slot's runtime name is a pure function of its identity
-// by design (ga-vcjr9 — minting a second box beside a live one leaks a runtime
-// nothing will ever address again), so the pool cannot route around the held
-// name. It drops to ZERO seats and every bead routed to that template becomes
-// unclaimable. Production ran that way for 3d10h (ga-rxhu2).
+// session_name and occupies its pool slot. The pool cannot route around it:
+// a tmux_alias slot's runtime name is a pure function of its identity, and an
+// unaliased slot's bead-scoped successor is only minted once the open row
+// releases the slot (ga-vcjr9 — minting a second box beside a live one leaks a
+// runtime nothing will ever address again). It drops to ZERO seats and every
+// bead routed to that template becomes unclaimable. Production ran that way for
+// 3d10h (ga-rxhu2).
 //
 // Ordering, load-bearing: this deadline must stay well ABOVE the drain-ack
 // deadline cycle and strandedRepairConfirmGrace (session_beads.go) so the
@@ -291,7 +293,7 @@ func poolSlotRetireBlocker(info sessionpkg.Info, now time.Time) string {
 // form <template>-<n> as a legitimate claim by that pool's own session. A pool
 // slot's alias diverges from its session_name exactly when the runtime name
 // steps aside to "<identity>-pool" — the ga-rxhu2 specimen's own shape. Probing
-// the narrower {ID, session_name, configured_named_identity} set would be blind
+// the narrower config-aware set, which drops a rebinding slot alias, would be blind
 // to the agent's own claims on precisely the configuration this bound targets,
 // and unlike every other consumer of that narrow set, this path uses the answer
 // to authorize a Kill, not just a close of an already-dead runtime.

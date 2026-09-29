@@ -247,9 +247,9 @@ func TestACPProtocolSigintCancelAnswersInFlightPrompt(t *testing.T) {
 	if !s.conn(t).isBusy() {
 		t.Fatal("prompt not in flight after Nudge")
 	}
-	// Interrupt signals the process group only after the fake has logged the
-	// prompt, so the cancel cannot race the prompt's arrival.
-	waitForMethod(t, s, "session/prompt")
+	// Interrupt only after the fake has registered the turn, so the SIGINT
+	// cannot land before there is a turn to cancel.
+	waitForPrompt(t, s)
 	if err := s.p.Interrupt(s.name); err != nil {
 		t.Fatalf("Interrupt: %v", err)
 	}
@@ -285,7 +285,7 @@ func TestACPProtocolSigintCancelStopReasonIsWireSpelling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sendRequest: %v", err)
 	}
-	waitForMethod(t, s, "session/prompt")
+	waitForPrompt(t, s)
 	if err := s.p.Interrupt(s.name); err != nil {
 		t.Fatalf("Interrupt: %v", err)
 	}
@@ -388,7 +388,7 @@ func TestACPProtocolTurnFailsWhenAgentExits(t *testing.T) {
 func TestACPProtocolWaitForIdleBlocksUntilTurnEnds(t *testing.T) {
 	s := startProtocolFake(t, "--sigint", "cancel", "--turn-delay", "1h")
 	s.nudge(t, "long turn")
-	waitForMethod(t, s, "session/prompt")
+	waitForPrompt(t, s)
 
 	if idle, err := s.p.SnapshotIdle(s.name); err != nil || idle {
 		t.Fatalf("SnapshotIdle = (%v, %v), want (false, nil) mid-turn", idle, err)
@@ -407,24 +407,22 @@ func TestACPProtocolWaitForIdleBlocksUntilTurnEnds(t *testing.T) {
 	}
 }
 
-// waitForMethod waits until the fake has logged an inbound method. The log
-// line is written before the fake acts on the message; each poll is a read
-// of that fact, bounded by protocolWait.
-func waitForMethod(t *testing.T, s *protocolSession, method string) {
+// waitForPrompt waits until the fake has recorded a session/prompt in
+// prompts.jsonl. That record is written inside runTurn, which starts only
+// after beginTurn has registered the turn, so a SIGINT sent afterwards always
+// finds the turn to cancel. (methods.jsonl is written before beginTurn and
+// would leave that window open.) Each poll is a read of that fact, bounded by
+// protocolWait.
+func waitForPrompt(t *testing.T, s *protocolSession) {
 	t.Helper()
 	deadline := time.NewTimer(protocolWait)
 	defer deadline.Stop()
 	tick := time.NewTicker(5 * time.Millisecond)
 	defer tick.Stop()
-	for {
-		for _, m := range s.methods(t) {
-			if m == method {
-				return
-			}
-		}
+	for len(s.jsonlRecords(t, "prompts.jsonl")) == 0 {
 		select {
 		case <-deadline.C:
-			t.Fatalf("fake never logged %q; methods = %v", method, s.methods(t))
+			t.Fatalf("fake never recorded a prompt; methods = %v", s.methods(t))
 		case <-tick.C:
 		}
 	}
