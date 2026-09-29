@@ -239,6 +239,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Text sent to a Claude session no longer answers its permission prompt,
+  and approvals are detected and answered on current Claude Code.** On
+  Claude Code 2.1.28x the tmux pane scraper missed the permission dialog
+  (new tool-line glyph, no "This command requires approval" line in the
+  default mode, a fourth menu option), so `GET .../pending` stayed empty and
+  `respond` returned `409 no_pending`, while an ordinary `submit` typed into
+  the prompt and its Enter approved the pending tool call. The dialog is now
+  recognized by its "Do you want to …?" question and numbered menu, and
+  `respond` picks the option by its label ("Yes", "No", …) instead of a fixed
+  digit, so `deny` can no longer select "Yes, and switch to auto mode"; when
+  no single option matches it sends nothing and returns 409
+  `invalid_interaction`. While a prompt is pending, `submit` and `messages`
+  return 409 `session-conflict` with a `pending_interaction:` detail, `gc
+  session nudge --delivery=immediate` exits non-zero, `--delivery=wait-idle`
+  queues behind the prompt, and the runtime refuses to type into it on every
+  other delivery path (#2892).
+
 - **The reaper's stale-issue auto-close works again when an open bead
   depends on a wisp or external bead.** Such a dependency has no
   `depends_on_issue_id`, and that NULL emptied the active-dependency exclusion,
