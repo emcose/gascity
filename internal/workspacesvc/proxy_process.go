@@ -23,10 +23,18 @@ import (
 )
 
 const (
-	proxyProcessReadyTimeout   = 5 * time.Second
 	proxyProcessRestartBackoff = 1 * time.Second
 	proxyProcessShutdownWait   = 2 * time.Second
 )
+
+// proxyProcessReadyTimeout is how long a freshly started helper has to accept
+// connections and pass its health check. Manager.Tick runs inline on the
+// controller tick and start blocks for this long per service that never becomes
+// ready, so raising it in production stalls the controller instead of fixing a
+// slow start. Tests raise it once, from init, so a starved host cannot turn a
+// slow helper start into a failure; production never assigns it, and tests are
+// serial, so no locking is needed.
+var proxyProcessReadyTimeout = 5 * time.Second
 
 var errProxyProcessExitedEarly = errors.New("process exited before listener became ready")
 
