@@ -67,9 +67,15 @@ func (h *sessionEventHub) subscribe(ctx context.Context) <-chan runtime.SessionE
 		ch:   make(chan runtime.SessionEvent, sessionEventBuffer),
 		wake: make(chan struct{}, 1),
 	}
-	// The channel is empty and not yet shared, so this cannot block.
-	sub.ch <- resyncEvent()
+	// Seed the resync and register under one critical section. Registering
+	// after the send would leave a window where a publisher iterating h.subs
+	// finds no subscriber, so it takes neither the deliver nor the
+	// drop-then-resync path and the event vanishes with no resync following
+	// it — the one loss mode runtime.SessionEventProvider forbids. Holding
+	// h.mu orders every publisher after the seed instead. The send cannot
+	// block: the channel is empty, not yet shared, and buffered.
 	h.mu.Lock()
+	sub.ch <- resyncEvent()
 	h.subs[sub] = struct{}{}
 	h.mu.Unlock()
 	go h.serve(ctx, sub)

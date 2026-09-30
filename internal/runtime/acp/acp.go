@@ -28,12 +28,6 @@ import (
 // follow an expired grace.
 const stopSocketReplyMargin = 2 * time.Second
 
-// nudgeDrainedExitGrace caps how long Nudge waits for sc.done when the stdout
-// reader has already drained. An agent that exited is reaped within this
-// window (best-effort nil); a live agent whose output can no longer be read
-// is reported as an error instead of receiving a turn that can never finish.
-const nudgeDrainedExitGrace = 500 * time.Millisecond
-
 // Config holds ACP provider settings.
 type Config struct {
 	HandshakeTimeout  time.Duration // default 30s
@@ -585,6 +579,12 @@ func (p *Provider) Stop(name string) error {
 	if ok {
 		if !sc.alive() {
 			p.cleanupMeta(name)
+			// cmd != nil is the observable proxy for "this conn came from
+			// newSessionConn", which is what guarantees exitReported is
+			// non-nil; emitClosed waits on that channel, and waiting on a nil
+			// one would block Stop forever. Start's sentinel conn is the only
+			// conn built outside newSessionConn, and Stop returns above before
+			// reaching here for it.
 			if sc.cmd != nil {
 				sc.emitClosed()
 			}
@@ -707,11 +707,17 @@ func (p *Provider) nudgeConn(name string, sc *sessionConn, content []runtime.Con
 	// respond before setActivePrompt runs, leaving busy set permanently.
 	if !sc.setActivePrompt(id) {
 		// The stdout reader has drained, so no response could settle this
-		// turn. An exiting agent keeps the best-effort nil contract.
+		// turn. An exiting agent keeps the best-effort nil contract. The bound
+		// is stopGrace() for the same reason the pipe-write branch below uses
+		// it: both wait out the identical "agent is exiting" race, so they must
+		// move together when Config.StopGrace is tuned. A live agent whose
+		// output can no longer be read is reported as an error instead of
+		// receiving a turn that can never finish, but only after the full
+		// bound, which is runtime.ManagedProcessStopGrace by default.
 		select {
 		case <-sc.done:
 			return nil
-		case <-time.After(nudgeDrainedExitGrace):
+		case <-time.After(p.cfg.stopGrace()):
 			return fmt.Errorf("sending prompt to %q: %w", name, errACPConnClosed(name))
 		}
 	}

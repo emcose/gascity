@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -164,7 +165,9 @@ func TestTurnRecordOutcomes(t *testing.T) {
 
 // TestPromptOutcomeToleratesUnstableUsage pins that a usage object gc cannot
 // decode never fails a turn: the stop reason is kept and only usage drops.
-// 12.0 is an integer under JSON Schema 2020-12, and some agents emit it.
+// An integral float decodes rather than dropping, because 12.0 is an integer
+// under JSON Schema 2020-12 and some agents emit counts that way; a count with
+// a nonzero fractional part, a quoted count, and one past int64 still drop.
 func TestPromptOutcomeToleratesUnstableUsage(t *testing.T) {
 	cases := []struct {
 		name         string
@@ -179,8 +182,26 @@ func TestPromptOutcomeToleratesUnstableUsage(t *testing.T) {
 			result:    `{"stopReason":"end_turn","usage":{"inputTokens":12,"outputTokens":3,"totalTokens":15}}`,
 			wantUsage: &turnUsage{InputTokens: 12, OutputTokens: 3, TotalTokens: 15},
 		},
-		{name: "float counts", result: `{"stopReason":"end_turn","usage":{"inputTokens":12.0,"outputTokens":3,"totalTokens":15}}`, wantUsageErr: true},
+		{
+			name:      "integral float counts",
+			result:    `{"stopReason":"end_turn","usage":{"inputTokens":12.0,"outputTokens":3,"totalTokens":15}}`,
+			wantUsage: &turnUsage{InputTokens: 12, OutputTokens: 3, TotalTokens: 15},
+		},
+		{
+			name:      "integral float counts in exponent form",
+			result:    `{"stopReason":"end_turn","usage":{"inputTokens":1.2e1,"outputTokens":3,"totalTokens":15}}`,
+			wantUsage: &turnUsage{InputTokens: 12, OutputTokens: 3, TotalTokens: 15},
+		},
+		{
+			name:      "null counts are zero",
+			result:    `{"stopReason":"end_turn","usage":{"inputTokens":null,"outputTokens":3,"totalTokens":15}}`,
+			wantUsage: &turnUsage{OutputTokens: 3, TotalTokens: 15},
+		},
+		{name: "fractional counts", result: `{"stopReason":"end_turn","usage":{"inputTokens":12.5,"outputTokens":3,"totalTokens":15}}`, wantUsageErr: true},
+		{name: "counts past int64", result: `{"stopReason":"end_turn","usage":{"inputTokens":1e30,"outputTokens":3,"totalTokens":15}}`, wantUsageErr: true},
 		{name: "string counts", result: `{"stopReason":"end_turn","usage":{"inputTokens":"12","outputTokens":"3","totalTokens":"15"}}`, wantUsageErr: true},
+		{name: "a single quoted count", result: `{"stopReason":"end_turn","usage":{"inputTokens":"12","outputTokens":3,"totalTokens":15}}`, wantUsageErr: true},
+		{name: "counts that are not numbers", result: `{"stopReason":"end_turn","usage":{"inputTokens":{},"outputTokens":3,"totalTokens":15}}`, wantUsageErr: true},
 		{name: "not an object", result: `{"stopReason":"end_turn","usage":[1,2]}`, wantUsageErr: true},
 	}
 	for _, tc := range cases {
@@ -202,13 +223,26 @@ func TestPromptOutcomeToleratesUnstableUsage(t *testing.T) {
 		})
 	}
 
-	t.Run("recorded turn keeps the stop reason", func(t *testing.T) {
+	t.Run("recorded turn keeps the stop reason when usage drops", func(t *testing.T) {
+		sc := newSessionConn(nil, nil, nil, 10, nil)
+		sc.setActivePrompt(4)
+		respondTo(sc, 4, `{"stopReason":"end_turn","usage":{"inputTokens":12.5}}`)
+		_, last := sc.turns()
+		if last == nil || last.State != turnCompleted || last.StopReason != "end_turn" || last.Usage != nil || last.Error != "" {
+			t.Fatalf("last turn = %+v, want completed end_turn without usage", last)
+		}
+	})
+
+	t.Run("recorded turn keeps an integral float usage", func(t *testing.T) {
 		sc := newSessionConn(nil, nil, nil, 10, nil)
 		sc.setActivePrompt(4)
 		respondTo(sc, 4, `{"stopReason":"end_turn","usage":{"inputTokens":12.0}}`)
 		_, last := sc.turns()
-		if last == nil || last.State != turnCompleted || last.StopReason != "end_turn" || last.Usage != nil || last.Error != "" {
-			t.Fatalf("last turn = %+v, want completed end_turn without usage", last)
+		if last == nil || last.State != turnCompleted || last.StopReason != "end_turn" || last.Error != "" {
+			t.Fatalf("last turn = %+v, want completed end_turn", last)
+		}
+		if last.Usage == nil || last.Usage.InputTokens != 12 {
+			t.Fatalf("last turn usage = %+v, want inputTokens 12", last.Usage)
 		}
 	})
 
@@ -219,6 +253,64 @@ func TestPromptOutcomeToleratesUnstableUsage(t *testing.T) {
 			t.Fatalf("outcome = %+v, want failed", got)
 		}
 	})
+}
+
+// TestTurnUsageMirrorsWire keeps turnUsage, turnUsageWire, and the usage()
+// table in step. The two structs must list the same fields in the same order,
+// and a wire object with a distinct count in every field must decode each
+// count into the matching recorded field: a count missing from the table
+// would otherwise record as 0 with no error.
+func TestTurnUsageMirrorsWire(t *testing.T) {
+	wire := reflect.TypeOf(turnUsageWire{})
+	recorded := reflect.TypeOf(turnUsage{})
+	if wire.NumField() != recorded.NumField() {
+		t.Fatalf("turnUsageWire has %d fields, turnUsage has %d", wire.NumField(), recorded.NumField())
+	}
+	counts := make(map[string]int64, wire.NumField())
+	for i := range wire.NumField() {
+		if got, want := recorded.Field(i).Name, wire.Field(i).Name; got != want {
+			t.Fatalf("turnUsage field %d is %s, turnUsageWire field %d is %s", i, got, i, want)
+		}
+		key, _, _ := strings.Cut(wire.Field(i).Tag.Get("json"), ",")
+		counts[key] = int64(i + 1)
+	}
+	raw, err := json.Marshal(counts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	usage, err := decodeTurnUsage(raw)
+	if err != nil || usage == nil {
+		t.Fatalf("decodeTurnUsage(%s) = %+v, %v; want every count", raw, usage, err)
+	}
+	got := reflect.ValueOf(*usage)
+	for i := range got.NumField() {
+		if count := got.Field(i).Int(); count != int64(i+1) {
+			t.Errorf("turnUsage.%s = %d, want %d from %s", recorded.Field(i).Name, count, i+1, raw)
+		}
+	}
+}
+
+// TestUsageCountBoundsEchoedValue pins that every usageCount rejection quotes
+// at most usageEchoLimit runes of the agent's value, so an agent cannot put an
+// arbitrarily long payload into the operator's log.
+func TestUsageCountBoundsEchoedValue(t *testing.T) {
+	long := strings.Repeat("5", 2*usageEchoLimit)
+	for _, tc := range []struct {
+		name, raw, reason string
+	}{
+		{"quoted", `"` + long + `"`, "is quoted, not a number"},
+		{"not a number", "[" + long + "]", "is not a number"},
+		{"not an integer", "1." + long, "is not an integer"},
+		{"past int64", long, "does not fit an int64"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := usageCount(json.RawMessage(tc.raw))
+			want := tc.raw[:usageEchoLimit] + " " + tc.reason
+			if err == nil || err.Error() != want {
+				t.Fatalf("usageCount error = %v, want %q", err, want)
+			}
+		})
+	}
 }
 
 // TestReadErrorIsNotAgentExit pins that a stdout read failure while the
@@ -249,15 +341,28 @@ func TestReadErrorIsNotAgentExit(t *testing.T) {
 }
 
 // TestNudgeRefusesDrainedConnection pins that a live agent whose stdout can
-// no longer be read does not get a turn that could never finish.
+// no longer be read does not get a turn that could never finish, and that the
+// wait for its exit is bounded by Config.StopGrace. StopGrace is the bound the
+// sibling pipe-write branch already uses for the identical "agent is exiting"
+// race, so a grace that did not move with the configured value would let a
+// tuned StopGrace change one branch but not the other.
 func TestNudgeRefusesDrainedConnection(t *testing.T) {
+	const stopGrace = 20 * time.Millisecond
 	p := newTestProvider(t)
+	p.cfg.StopGrace = stopGrace
 	name, sc := injectConn(t, p)
 	sc.drainPending(errors.New("bufio.Scanner: token too long"))
 
+	start := time.Now()
 	err := p.Nudge(name, runtime.TextContent("hello"))
+	elapsed := time.Since(start)
 	if !errors.Is(err, runtime.ErrSessionNotFound) {
 		t.Fatalf("Nudge = %v, want ErrSessionNotFound for a drained live connection", err)
+	}
+	// Generous headroom for a loaded host, but well under the wait a bound
+	// that ignored Config.StopGrace would have taken.
+	if elapsed > 250*time.Millisecond {
+		t.Fatalf("Nudge waited %v on a drained connection, want the configured StopGrace of %v", elapsed, stopGrace)
 	}
 	if current, _ := sc.turns(); current != nil || sc.isBusy() {
 		t.Fatalf("Nudge opened turn %+v on a drained connection", current)

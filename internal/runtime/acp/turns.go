@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/runtime"
@@ -56,15 +57,97 @@ type promptResult struct {
 	Usage      json.RawMessage `json:"usage,omitempty"`
 }
 
-// turnUsage is the unstable ACP token-usage object an agent may attach to a
-// session/prompt result. Agents that omit it leave the record's Usage nil.
+// turnUsage is the token usage recorded for a turn, decoded from a
+// turnUsageWire. Agents that report no usage leave the record's Usage nil.
+// Its fields mirror turnUsageWire one for one; TestTurnUsageMirrorsWire keeps
+// the two structs and the usage() table in step.
 type turnUsage struct {
-	InputTokens       int64 `json:"inputTokens"`
-	OutputTokens      int64 `json:"outputTokens"`
-	TotalTokens       int64 `json:"totalTokens"`
-	ThoughtTokens     int64 `json:"thoughtTokens,omitempty"`
-	CachedReadTokens  int64 `json:"cachedReadTokens,omitempty"`
-	CachedWriteTokens int64 `json:"cachedWriteTokens,omitempty"`
+	InputTokens       int64
+	OutputTokens      int64
+	TotalTokens       int64
+	ThoughtTokens     int64
+	CachedReadTokens  int64
+	CachedWriteTokens int64
+}
+
+// turnUsageWire is the unstable ACP token-usage object an agent may attach to
+// a session/prompt result. The counts stay raw rather than decoding straight
+// to int64 so an integral float spelling survives: 12.0 is an integer under
+// JSON Schema 2020-12 and some agents emit counts that way, but encoding/json
+// rejects it for an int64 field. They are not [json.Number] either, because
+// encoding/json accepts a QUOTED numeric literal for a json.Number target
+// ("12" decodes as 12), and a quoted count is one of the shapes that must
+// drop.
+type turnUsageWire struct {
+	InputTokens       json.RawMessage `json:"inputTokens"`
+	OutputTokens      json.RawMessage `json:"outputTokens"`
+	TotalTokens       json.RawMessage `json:"totalTokens"`
+	ThoughtTokens     json.RawMessage `json:"thoughtTokens"`
+	CachedReadTokens  json.RawMessage `json:"cachedReadTokens"`
+	CachedWriteTokens json.RawMessage `json:"cachedWriteTokens"`
+}
+
+// usage converts the wire counts to the recorded form. Any count that is not
+// an integer drops the whole usage object, which keeps a partially-decoded
+// usage from being recorded as if the agent had reported it.
+func (w turnUsageWire) usage() (*turnUsage, error) {
+	var out turnUsage
+	for _, field := range []struct {
+		name string
+		raw  json.RawMessage
+		dst  *int64
+	}{
+		{"inputTokens", w.InputTokens, &out.InputTokens},
+		{"outputTokens", w.OutputTokens, &out.OutputTokens},
+		{"totalTokens", w.TotalTokens, &out.TotalTokens},
+		{"thoughtTokens", w.ThoughtTokens, &out.ThoughtTokens},
+		{"cachedReadTokens", w.CachedReadTokens, &out.CachedReadTokens},
+		{"cachedWriteTokens", w.CachedWriteTokens, &out.CachedWriteTokens},
+	} {
+		count, err := usageCount(field.raw)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", field.name, err)
+		}
+		*field.dst = count
+	}
+	return &out, nil
+}
+
+// usageEchoLimit caps how much of a rejected count usageCount quotes in its
+// error, in runes. The value comes from the agent and the error reaches the
+// operator's stderr, so an arbitrarily long payload is cut short.
+const usageEchoLimit = 64
+
+// usageCount reads one token count. An absent or null field is zero. A plain
+// integer and an integral float (12.0, 1.2e1) both decode; a quoted count, a
+// count with a nonzero fractional part, one that does not fit an int64, and a
+// non-numeric value are all errors.
+func usageCount(raw json.RawMessage) (int64, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return 0, nil
+	}
+	// A quoted count is a JSON string, not a number. This has to be explicit:
+	// encoding/json would accept it for a json.Number target.
+	if raw[0] == '"' {
+		return 0, fmt.Errorf("%.*s is quoted, not a number", usageEchoLimit, raw)
+	}
+	number := json.Number(raw)
+	if count, err := number.Int64(); err == nil {
+		return count, nil
+	}
+	value, err := number.Float64()
+	if err != nil {
+		return 0, fmt.Errorf("%.*s is not a number", usageEchoLimit, raw)
+	}
+	if value != math.Trunc(value) {
+		return 0, fmt.Errorf("%.*s is not an integer", usageEchoLimit, raw)
+	}
+	// float64 rounds math.MaxInt64 up to 2^63, so the upper bound must
+	// exclude it: every float at or above 2^63 overflows int64.
+	if value < math.MinInt64 || value >= math.MaxInt64 {
+		return 0, fmt.Errorf("%.*s does not fit an int64", usageEchoLimit, raw)
+	}
+	return int64(value), nil
 }
 
 // turnRecord describes one session/prompt turn. A sessionConn keeps only the
@@ -127,11 +210,15 @@ func decodeTurnUsage(raw json.RawMessage) (*turnUsage, error) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil, nil
 	}
-	var usage turnUsage
-	if err := json.Unmarshal(raw, &usage); err != nil {
+	var wire turnUsageWire
+	if err := json.Unmarshal(raw, &wire); err != nil {
 		return nil, fmt.Errorf("decoding session/prompt usage: %w", err)
 	}
-	return &usage, nil
+	usage, err := wire.usage()
+	if err != nil {
+		return nil, fmt.Errorf("decoding session/prompt usage: %w", err)
+	}
+	return usage, nil
 }
 
 // newTurnID returns a random RFC 4122 version 4 UUID.
@@ -293,6 +380,15 @@ func (sc *sessionConn) awaitIdle(ctx context.Context, name string, idleCh <-chan
 // SnapshotIdle reports whether the named session has no session/prompt
 // response outstanding right now. A session this provider does not own, or
 // whose agent connection has closed, is an error, never idle.
+//
+// The only caller today is the reconciler's content clock, which excludes the
+// ACP transport by construction (idleTrackerContentClockApplies: ACP delivers
+// in-process, with no repainting pane to scan), so this answer is unreachable
+// through that path. It is implemented anyway to keep the optional-interface
+// set complete for a provider that can answer it cheaply and correctly — the
+// wrapping seam, auto, and hybrid all forward it, so a future caller that is
+// not gated on transport gets the real answer rather than
+// ErrInteractionUnsupported.
 func (p *Provider) SnapshotIdle(name string) (bool, error) {
 	sc, err := p.idleConn(name)
 	if err != nil {

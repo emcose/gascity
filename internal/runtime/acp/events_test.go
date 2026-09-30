@@ -260,6 +260,49 @@ func TestSessionEventsSlowSubscriberGetsResyncAfterDrops(t *testing.T) {
 	})
 }
 
+// TestSessionEventHubSubscribeRacesPublish is a race-detector smoke test for
+// subscribe's critical section. It runs a publisher concurrently with
+// subscribe and checks that the opening resync always leads the stream, the
+// racing event never arrives ahead of it, no other event appears, and the
+// stream closes cleanly. It cannot catch a regression to seeding the resync
+// before registering the subscriber: a publish lost in that window looks the
+// same as one that ran entirely before subscribe, whose event the opening
+// resync covers, so the test stays green either way. The comment in subscribe
+// is what guards that ordering.
+func TestSessionEventHubSubscribeRacesPublish(t *testing.T) {
+	for range 100 {
+		h := newSessionEventHub()
+		ctx, cancel := context.WithCancel(context.Background())
+
+		start := make(chan struct{})
+		published := make(chan struct{})
+		go func() {
+			defer close(published)
+			<-start
+			h.publish(runtime.SessionEvent{
+				Kind:    runtime.SessionEventAgentIdle,
+				Session: "racer",
+				Time:    time.Now(),
+			})
+		}()
+
+		close(start)
+		ch := h.subscribe(ctx)
+		<-published
+
+		expectResync(t, ch)
+		cancel()
+		for ev := range ch {
+			switch {
+			case ev.Kind == runtime.SessionEventResync:
+			case ev.Kind == runtime.SessionEventAgentIdle && ev.Session == "racer":
+			default:
+				t.Fatalf("event = %s(%q), want only the racing agent_idle or a resync", ev.Kind, ev.Session)
+			}
+		}
+	}
+}
+
 // TestSessionEventHubDeliversWhileResyncPending pins that a subscriber with
 // room receives an event even while the resync for an earlier drop has not
 // been sent yet: the hub drops only under backpressure.
