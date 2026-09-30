@@ -18,7 +18,13 @@ package main
 // is also the one layer that can see a bead engine's ready projection, which it
 // finds by type-asserting its backing, so any wrapper between the two turns the
 // projection off. Cache over engine, emitting through the cache's own onChange,
-// satisfies both. The rows carry the cache-reconcile actor, the one the work
+// satisfies both. The one layer the cache keeps over the engine is storage
+// boot's route-change-clearing decorator: the controller's recovery lanes
+// repair routes through the binding, so they need its gate, and it is held to
+// the engines' method sets so the cache still finds every capability it
+// discovers through its backing, the ready projection included
+// (TestRouteClearCarriesEveryBindingEngineCapability). The rows carry the
+// cache-reconcile actor, the one the work
 // ledger's cache stamps on the identical write on a city that relocates
 // nothing, so a split city's events poke, enqueue and fold exactly as a
 // single-store city's do.
@@ -132,12 +138,13 @@ func (r *storageRoutes) namespacesServedBy(store beads.Store) []string {
 }
 
 // bindingEngine returns the bead engine under a class store's process layers:
-// the controller's CachingStore and the one-shot CLI's emitter. Questions about
-// the engine itself — which store the boot census read, whether it is the
-// SQLite ledger — are asked of this, never of the wrapper a class accessor
-// hands out.
-// Each layer is peeled once; neither can wrap itself, so the walk ends at the
-// first store that is neither.
+// the controller's CachingStore, the one-shot CLI's emitter, and the
+// route-change-clearing decorator storage boot puts on the engine it opens
+// (openStorageRoutes). Questions about the engine itself — which store the boot
+// census read, whether it is the SQLite ledger — are asked of this, never of the
+// wrapper a class accessor hands out.
+// Each layer is peeled once, so the walk ends at the first store that is none
+// of them.
 func bindingEngine(store beads.Store) beads.Store {
 	for {
 		switch layer := store.(type) {
@@ -146,7 +153,11 @@ func bindingEngine(store beads.Store) beads.Store {
 		case *emittingClassStore:
 			store = layer.Store
 		default:
-			return store
+			inner, guarded := beads.UnwrapRouteChangeClearing(store)
+			if !guarded {
+				return store
+			}
+			store = inner
 		}
 	}
 }

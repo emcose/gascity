@@ -731,6 +731,11 @@ func recordStorageBindingOutcome(rec events.Recorder, report infraMigrationRepor
 // root (cmd/gc/api_state.go, cmd/gc/store_rollout.go, cmd/gc/main.go).
 // Wrapping here instead of at each downstream call site means the fix also
 // covers call sites that reach a binding-owned bead this way in the future.
+//
+// The decorator is one of the layers a binding is wrapped in, so it is held to
+// the engines' method sets as the emitter and the controller's cache are
+// (TestRouteClearCarriesEveryBindingEngineCapability), and bindingEngine peels
+// it when asked which engine a class store sits on.
 func openStorageRoutes(plan *storebinding.StoragePlan, target infraBindingTarget, cfg *config.City) (*storageRoutes, error) {
 	if plan == nil {
 		return nil, errors.New("storage routing: no resolved plan")

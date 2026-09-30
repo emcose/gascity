@@ -376,6 +376,16 @@ func TestRelocatedSQLiteSessionLedgerSeesThroughRouteClear(t *testing.T) {
 	}
 }
 
+func atomicCloserDiscovery(store beads.Store) bool {
+	_, ok := beads.AtomicConditionalCloserFor(store)
+	return ok
+}
+
+func conditionalWriterDiscovery(store beads.Store) bool {
+	_, ok := beads.ConditionalWriterFor(store)
+	return ok
+}
+
 // routeClearOmittedEngineCapabilities are the binding-engine methods the
 // decorator does not carry structurally, each with why. A method listed with a
 // discovery must still be found through its handle over a SQLite engine. The
@@ -391,13 +401,19 @@ var routeClearOmittedEngineCapabilities = map[string]func(beads.Store) bool{
 		_, storage := applier.(beads.StorageGraphApplyStore)
 		return ok && storage
 	},
-	"SupportsEphemeralGraphApply": func(store beads.Store) bool {
-		applier, ok := beads.GraphApplyFor(store)
-		_, ephemeral := applier.(beads.EphemeralGraphApplyStore)
-		return ok && ephemeral
-	},
-	"CloseWithMetadataIfMatch": func(store beads.Store) bool {
-		_, ok := beads.AtomicConditionalCloserFor(store)
+	// GraphApplyFor hands back the engine's own applier, so the engine's answer
+	// to this question -- absence, for SQLite -- is what a caller gets.
+	"SupportsEphemeralGraphApply": nil,
+	// Resolved through ConditionalWritesResolveTarget to the terminal engine.
+	"CloseWithMetadataIfMatch":      atomicCloserDiscovery,
+	"AtomicConditionalCloserHandle": atomicCloserDiscovery,
+	// The revision-fenced writers are discovered through handles that delegate
+	// to the backing; the route-clearing gate does not intercept them.
+	"UpdateIfMatch": conditionalWriterDiscovery,
+	"CloseIfMatch":  conditionalWriterDiscovery,
+	"DeleteIfMatch": conditionalWriterDiscovery,
+	"CompareAndSetMetadataKey": func(store beads.Store) bool {
+		_, ok := beads.MetadataCASWriterFor(store)
 		return ok
 	},
 	// Discovered through NamespaceCensusHandle only. Carrying HasResidentOutside
@@ -506,6 +522,63 @@ func TestRouteClearRefusesAnEdgePayloadItsBackingCannotHold(t *testing.T) {
 	if err := writer.DepAddWithMetadata("gcg-1", "gcg-2", "blocks", `{"gate":"waits_for"}`); err == nil {
 		t.Fatal("the decorator reported success writing a payload its backing cannot hold; the edge would be written without it")
 	}
+}
+
+// storageSpyStore is a backing that supports storage-tier creates and records
+// the class it was asked for.
+type storageSpyStore struct {
+	beads.Store
+	got beads.StorageClass
+}
+
+func (s *storageSpyStore) CreateWithStorage(b beads.Bead, storage beads.StorageClass) (beads.Bead, error) {
+	s.got = storage
+	return s.Create(b)
+}
+
+// TestRouteClearCreatesWithStorageWithoutChangingWhatCallersObserve pins both
+// halves of the decorator's storage-tier create. Over a backing that supports it
+// the class must reach the backing, or a policy-selected ephemeral bead is
+// silently created in the history tier. Over one that does not, the method's
+// presence must not turn the fallback every caller was owed into an error: the
+// class becomes the bead's flags, exactly as CachingStore.CreateWithStorage does
+// for the same absence.
+func TestRouteClearCreatesWithStorageWithoutChangingWhatCallersObserve(t *testing.T) {
+	t.Run("a supporting backing receives the class", func(t *testing.T) {
+		spy := &storageSpyStore{Store: beads.NewMemStore()}
+		creator, ok := beads.WithRouteChangeClearing(spy, routeClearIdentity).(beads.StorageCreateStore)
+		if !ok {
+			t.Fatal("the decorator cannot create with a storage class")
+		}
+		if _, err := creator.CreateWithStorage(beads.Bead{Title: "wisp", Type: "task"}, beads.StorageEphemeral); err != nil {
+			t.Fatalf("CreateWithStorage: %v", err)
+		}
+		if spy.got != beads.StorageEphemeral {
+			t.Fatalf("the backing was asked for storage class %q, want %q: the tier the caller selected was dropped", spy.got, beads.StorageEphemeral)
+		}
+	})
+
+	t.Run("a backing without one gets the cache's flag translation", func(t *testing.T) {
+		mem := beads.NewMemStore()
+		if _, ok := beads.Store(mem).(beads.StorageCreateStore); ok {
+			t.Fatal("MemStore now supports storage classes, so it is no longer the backing this test needs")
+		}
+		creator, ok := beads.WithRouteChangeClearing(mem, routeClearIdentity).(beads.StorageCreateStore)
+		if !ok {
+			t.Fatal("the decorator cannot create with a storage class")
+		}
+		created, err := creator.CreateWithStorage(beads.Bead{Title: "wisp", Type: "task"}, beads.StorageEphemeral)
+		if err != nil {
+			t.Fatalf("CreateWithStorage over a backing without the capability = %v, want the flag-translating fallback", err)
+		}
+		got, err := mem.Get(created.ID)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if !got.Ephemeral {
+			t.Fatalf("the created bead is %+v, want the ephemeral flag the storage class asked for", got)
+		}
+	})
 }
 
 // TestRouteClearReportsAtomicTxLikeItsBacking pins a capability the cache and

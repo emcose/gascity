@@ -53,6 +53,9 @@ func WithRouteChangeClearing(store Store, normalizer RouteNormalizerFunc) Store 
 // one layer: a caller that needs more loops, since a decorator may sit over
 // another process layer.
 func UnwrapRouteChangeClearing(store Store) (Store, bool) {
+	if guard, ok := store.(*routeChangeClearingStore); ok && guard != nil {
+		return guard.Store, true
+	}
 	return store, false
 }
 
@@ -68,6 +71,14 @@ var (
 	_ ContextReadyReader               = (*routeChangeClearingStore)(nil)
 	_ ExactBatchGetter                 = (*routeChangeClearingStore)(nil)
 	_ ProxiedStoreCarrier              = (*routeChangeClearingStore)(nil)
+	_ DepMetadataWriter                = (*routeChangeClearingStore)(nil)
+	_ AtomicTxStore                    = (*routeChangeClearingStore)(nil)
+	_ ReadOnlyReporter                 = (*routeChangeClearingStore)(nil)
+	_ ParentProjectionWaiter           = (*routeChangeClearingStore)(nil)
+	_ StorageCreateStore               = (*routeChangeClearingStore)(nil)
+	_ NamespaceCensusHandleProvider    = (*routeChangeClearingStore)(nil)
+	_ ConditionalWriterHandleProvider  = (*routeChangeClearingStore)(nil)
+	_ MetadataCASWriterHandleProvider  = (*routeChangeClearingStore)(nil)
 )
 
 // ConditionalWritesResolveTarget declares the immediate backing store as the
@@ -317,6 +328,101 @@ func (w *routeChangeClearingStore) GetExactBatch(ids []string) (map[string]Bead,
 // (cmd/gc/bead_policy_store.go) finds it.
 func (w *routeChangeClearingStore) ProxiedStore() (ProxiedStoreView, bool) {
 	return ProxiedStoreFrom(w.Store)
+}
+
+// DepAddWithMetadata forwards the backing store's edge-payload write
+// (DepMetadataWriter), the write half of DepMetadata above. An edge payload is
+// what formula gating carries on a dependency, so without this forward the
+// one-shot CLI over a split city (the emitter over this decorator) refuses every
+// payload-bearing edge. A backing store that cannot carry a payload gets an
+// error rather than a plain DepAdd: on a store that keeps the payload in a
+// sidecar the fallback would clear a payload the edge already had.
+func (w *routeChangeClearingStore) DepAddWithMetadata(issueID, dependsOnID, depType, metadata string) error {
+	writer, ok := w.Store.(DepMetadataWriter)
+	if !ok {
+		return fmt.Errorf("writing dependency metadata %s -> %s: route-clearing-wrapped store %T cannot carry an edge payload", issueID, dependsOnID, w.Store)
+	}
+	return writer.DepAddWithMetadata(issueID, dependsOnID, depType, metadata)
+}
+
+// AtomicTx reports whether the backing store's Tx rolls the whole callback back
+// on error (AtomicTxStore), derived from the backing exactly as
+// CachingStore.AtomicTx derives it. Tx itself is promoted from the embedded
+// Store and runs against the backing unchanged, so the backing's answer is the
+// right one; without it the cache and the emitter over this decorator read false
+// for an engine that is atomic.
+func (w *routeChangeClearingStore) AtomicTx() bool { return StoreSupportsAtomicTx(w.Store) }
+
+// ReadOnly forwards the backing store's mutation fence (ReadOnlyReporter). A
+// store with none answers false, the honest answer for every engine that cannot
+// be latched. Swallowing the question would make a wrapped read-only handle
+// report itself writable, the one direction this answer must never be wrong in.
+func (w *routeChangeClearingStore) ReadOnly() bool {
+	reporter, ok := w.Store.(ReadOnlyReporter)
+	return ok && reporter.ReadOnly()
+}
+
+// WaitForParentProjection forwards the backing store's parent-projection wait
+// (ParentProjectionWaiter). A backing whose listing view cannot lag a reparent
+// has nothing to wait for, so its absence is success, matching the emitter's
+// answer for the same question.
+func (w *routeChangeClearingStore) WaitForParentProjection(ctx context.Context, id, oldParentID, newParentID string) error {
+	waiter, ok := w.Store.(ParentProjectionWaiter)
+	if !ok {
+		return nil
+	}
+	return waiter.WaitForParentProjection(ctx, id, oldParentID, newParentID)
+}
+
+// CreateWithStorage forwards the backing store's storage-tier create
+// (StorageCreateStore), which policy middleware issues once a tier has been
+// selected. A creation-time route needs no stamp clearing -- no prior stamps can
+// exist -- so the create passes straight through. Presence of this method must
+// not change what a caller observes over a backing that lacks the capability, so
+// that case takes the fallback CachingStore.CreateWithStorage takes for the same
+// absence: translate the class into the bead's flags and create plainly. An
+// error there would replace a fallback the caller was already owed.
+func (w *routeChangeClearingStore) CreateWithStorage(b Bead, storage StorageClass) (Bead, error) {
+	if creator, ok := w.Store.(StorageCreateStore); ok {
+		return creator.CreateWithStorage(b, storage)
+	}
+	ephemeral, noHistory, err := effectiveStorageFlags(b, storage)
+	if err != nil {
+		return Bead{}, fmt.Errorf("route-clearing create: %w", err)
+	}
+	b.Ephemeral = ephemeral
+	b.NoHistory = noHistory
+	return w.Create(b)
+}
+
+// NamespaceCensusHandle exposes the backing store's namespace census without
+// claiming it when the backing cannot answer (NamespaceCensusHandleProvider).
+// HasResidentOutside is deliberately NOT carried structurally: a bare type
+// assertion would then succeed over a backing with no census, and the boot
+// verdict would retire a by-id probe on an answer nobody computed. Discovery goes
+// through NamespaceCensusFor, which consults this handle first; without it the
+// one-shot CLI over a SQLite binding rescans the whole binding on every command.
+func (w *routeChangeClearingStore) NamespaceCensusHandle() (NamespaceCensus, bool) {
+	return NamespaceCensusFor(w.Store)
+}
+
+// ConditionalWriterHandle exposes the backing store's conditional-write
+// capability to callers that discover it directly (ConditionalWriterFor), such
+// as the one-shot emitter's revision-fenced deletes, without claiming it
+// globally. The production resolver (ResolveConditionalWriter) never asks this
+// decorator: it follows ConditionalWritesResolveTarget to the terminal store
+// first, so rollout-mode gating is unchanged. Conditional writes are not
+// intercepted by the route-clearing gate; they reach the backing directly, as
+// they do through that resolver.
+func (w *routeChangeClearingStore) ConditionalWriterHandle() (ConditionalWriter, bool) {
+	return ConditionalWriterFor(w.Store)
+}
+
+// MetadataCASWriterHandle exposes the backing store's metadata compare-and-set
+// (MetadataCASWriterFor) for the same reason, and with the same bypass of the
+// route-clearing gate, as ConditionalWriterHandle above.
+func (w *routeChangeClearingStore) MetadataCASWriterHandle() (MetadataCASWriter, bool) {
+	return MetadataCASWriterFor(w.Store)
 }
 
 // SetMetadata clears the rerouted bead's (and its molecule root's) executor-

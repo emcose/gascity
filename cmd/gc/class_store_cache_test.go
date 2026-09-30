@@ -357,9 +357,17 @@ func TestSplitCityControllerBindingCacheComposition(t *testing.T) {
 	t.Cleanup(cancel)
 	cs, ep := newCachedSplitControllerState(ctx, t, routes, beads.NewMemStore())
 	cache := bindingCacheOf(t, cs)
-	engine, isSQLite := cache.Backing().(*beads.SQLiteStore)
+	// The one layer the cache keeps over the engine is storage boot's
+	// route-change-clearing decorator. It forwards the ready projection
+	// (TestControllerBindingCacheKeepsTheReadyProjectionThroughRouteClear) and
+	// every engine capability (TestRouteClearCarriesEveryBindingEngineCapability).
+	backing := cache.Backing()
+	if inner, guarded := beads.UnwrapRouteChangeClearing(backing); guarded {
+		backing = inner
+	}
+	engine, isSQLite := backing.(*beads.SQLiteStore)
 	if !isSQLite {
-		t.Fatalf("the binding cache's backing is %T, want the raw *beads.SQLiteStore: any layer between them hides the engine's ready projection", cache.Backing())
+		t.Fatalf("the binding cache's backing is %T, want the raw *beads.SQLiteStore under, at most, the route-change-clearing decorator: any other layer between them hides the engine's ready projection", cache.Backing())
 	}
 	awaitCond(t, func() bool { return cache.Stats().State == "live" }, "the binding cache's async prime")
 	if interval := cache.Stats().CurrentReconcileInterval; interval <= 0 || interval > 120*time.Second {
