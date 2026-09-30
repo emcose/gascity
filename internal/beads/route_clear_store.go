@@ -55,6 +55,8 @@ var (
 	_ Counter                          = (*routeChangeClearingStore)(nil)
 	_ RowWitness                       = (*routeChangeClearingStore)(nil)
 	_ ContextReadyReader               = (*routeChangeClearingStore)(nil)
+	_ ExactBatchGetter                 = (*routeChangeClearingStore)(nil)
+	_ ProxiedStoreCarrier              = (*routeChangeClearingStore)(nil)
 )
 
 // ConditionalWritesResolveTarget declares the immediate backing store as the
@@ -268,6 +270,42 @@ func (w *routeChangeClearingStore) Handles() StoreHandles {
 	handles := HandlesFor(w.Store)
 	handles.Writer = w
 	return handles
+}
+
+// GetExactBatch forwards the backing store's exact batch read
+// (ExactBatchGetter). Forwarded for the same reason as DepMetadata and the rest
+// above: the embedded Store field does not promote an optional capability, and
+// this decorator is the OUTERMOST wrapper on every CLI/standalone open
+// (cmd/gc/main.go applies it after wrapStoreWithBeadPolicies). Without this
+// forward, cmd/gc/cmd_bd.go's store.(beads.ExactBatchGetter) assertion fails on
+// the store openStoreAtForCityWithConfig hands it, so a bulk mutation -- a
+// maintenance order closing a batch of stale wisps -- verifies its ids with one
+// or two bd forks apiece instead of one batched read, silently undoing the
+// reason the batch read exists. Inner stores without the read report
+// ErrExactBatchGetUnsupported, matching beadPolicyStore.GetExactBatch
+// (cmd/gc/bead_policy_store.go), which callers answer with a per-id Get.
+func (w *routeChangeClearingStore) GetExactBatch(ids []string) (map[string]Bead, []string, error) {
+	getter, ok := w.Store.(ExactBatchGetter)
+	if !ok {
+		return nil, nil, ErrExactBatchGetUnsupported
+	}
+	return getter.GetExactBatch(ids)
+}
+
+// ProxiedStore forwards the split store underneath this decorator
+// (ProxiedStoreCarrier). Forwarded for the same reason as DepMetadata and the
+// rest above: the embedded Store field does not promote an optional capability.
+// This decorator is the OUTERMOST wrapper on every CLI/standalone open, so it is
+// the first thing ProxiedStoreFrom meets; without this forward the walk stops
+// here and answers "not a split store" for a proxied city, and internal/doctor's
+// live account (LiveProxiedDiagnostic) falls back to the account recorded at
+// open -- reporting a handle that has since stood down as still native. The walk
+// re-enters through ProxiedStoreFrom rather than asserting the carrier on the
+// backing store directly, so a backing store that IS the split store, or a
+// CachingStore over one, is found exactly as beadPolicyStore.ProxiedStore
+// (cmd/gc/bead_policy_store.go) finds it.
+func (w *routeChangeClearingStore) ProxiedStore() (ProxiedStoreView, bool) {
+	return ProxiedStoreFrom(w.Store)
 }
 
 // SetMetadata clears the rerouted bead's (and its molecule root's) executor-
