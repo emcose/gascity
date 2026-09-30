@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -248,9 +249,7 @@ func TestSweepStaleTmuxTestServers_ReapsRootGoneKeepsRootPresent(t *testing.T) {
 	tmuxtest.RequireTmux(t)
 	parent := shortSocketTempDir(t, "gct-sweeppar")
 	// Roots must look like "<...>/gct-<pid>-<x>/tmux" for the sweep to own
-	// them. (A concurrent sibling suite's startup sweep could theoretically
-	// reap goneRoot's server first — same decision, different reporter — but
-	// suite starts are rare relative to this test's window.)
+	// them.
 	goneRoot := filepath.Join(parent, "gct-99999999-gone", "tmux")
 	keptRoot := filepath.Join(parent, "gct-99999999-kept", "tmux")
 	_, gonePID := spawnGuardTestTmuxServer(t, goneRoot)
@@ -258,6 +257,12 @@ func TestSweepStaleTmuxTestServers_ReapsRootGoneKeepsRootPresent(t *testing.T) {
 	if err := os.RemoveAll(filepath.Dir(goneRoot)); err != nil {
 		t.Fatalf("remove gone root: %v", err)
 	}
+
+	// A sibling test binary's startup sweep lands between fixture setup and
+	// this test's own sweep. A full gate starts dozens of cmd/gc binaries at
+	// once, so this is routine, not theoretical (ga-ok9ick): the fixture must
+	// still prove the decision boundary through this test's own sweep.
+	sweepStaleTmuxTestServers("sibling", io.Discard)
 
 	var out bytes.Buffer
 	sweepStaleTmuxTestServers("test", &out)
