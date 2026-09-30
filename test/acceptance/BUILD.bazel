@@ -8,6 +8,7 @@ go_test(
         "agent_env_test.go",
         "agent_suspend_test.go",
         "beads_health_test.go",
+        "beads_managed_shared_server_test.go",
         "beads_migrate_proxied_test.go",
         "beads_proxied_default_test.go",
         "beads_proxied_native_safety_test.go",
