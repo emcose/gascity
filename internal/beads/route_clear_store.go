@@ -45,6 +45,17 @@ func WithRouteChangeClearing(store Store, normalizer RouteNormalizerFunc) Store 
 	return &routeChangeClearingStore{Store: store, normalizer: normalizer}
 }
 
+// UnwrapRouteChangeClearing returns the store a WithRouteChangeClearing
+// decorator wraps and reports whether store was one. It is for callers that
+// must identify the engine under the decorator -- cmd/gc's bindingEngine,
+// which answers whether a binding is served by the SQLite ledger -- where the
+// decorator would otherwise read as an unrecognized store. It peels exactly
+// one layer: a caller that needs more loops, since a decorator may sit over
+// another process layer.
+func UnwrapRouteChangeClearing(store Store) (Store, bool) {
+	return store, false
+}
+
 var (
 	_ ConditionalWritesResolveTargeter = (*routeChangeClearingStore)(nil)
 	_ DepMetadataReader                = (*routeChangeClearingStore)(nil)

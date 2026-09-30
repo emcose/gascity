@@ -531,3 +531,26 @@ func TestRouteChangeClearingStore_ImplementsConditionalWritesResolveTargeter(t *
 		t.Errorf("ConditionalWritesResolveTarget: want the immediate backing store, got a different store")
 	}
 }
+
+func TestUnwrapRouteChangeClearing(t *testing.T) {
+	mem := beads.NewMemStore()
+	wrapped := beads.WithRouteChangeClearing(mem, identityNormalizer)
+
+	if inner, ok := beads.UnwrapRouteChangeClearing(wrapped); !ok || inner != beads.Store(mem) {
+		t.Fatalf("UnwrapRouteChangeClearing(decorated) = (%v, %v), want the wrapped store and true", inner, ok)
+	}
+
+	// A stacked decorator comes off one layer at a time: a caller that needs the
+	// engine loops.
+	doubled := beads.WithRouteChangeClearing(wrapped, identityNormalizer)
+	if once, ok := beads.UnwrapRouteChangeClearing(doubled); !ok || once != wrapped {
+		t.Fatalf("a stacked decorator peeled to (%v, %v), want exactly one layer off", once, ok)
+	}
+
+	if got, ok := beads.UnwrapRouteChangeClearing(mem); ok || got != beads.Store(mem) {
+		t.Fatalf("UnwrapRouteChangeClearing(bare) = (%v, %v), want the same store and false", got, ok)
+	}
+	if got, ok := beads.UnwrapRouteChangeClearing(nil); ok || got != nil {
+		t.Fatalf("UnwrapRouteChangeClearing(nil) = (%v, %v), want (nil, false)", got, ok)
+	}
+}
