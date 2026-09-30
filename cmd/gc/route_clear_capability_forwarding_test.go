@@ -14,10 +14,11 @@ import (
 
 // fullyCapableBackingStore is a beads.Store test double that implements every
 // optional capability route_clear_store.go must forward: beads.GraphApplyStore
-// (via ApplyGraphPlan), beads.BatchDeleter, beads.Counter, beads.RowWitness and
-// beads.ContextReadyReader (via ReadyContext). None of the fast/hermetic test
-// backends (FileStore, MemStore) implement ApplyGraphPlan, DeleteBatch, Count
-// or SawRows -- only BdStore, NativeDoltStore and CachingStore do, and none of
+// (via ApplyGraphPlan), beads.BatchDeleter, beads.Counter, beads.RowWitness,
+// beads.ExactBatchGetter (via GetExactBatch) and beads.ContextReadyReader (via
+// ReadyContext). None of the fast/hermetic test backends (FileStore, MemStore)
+// implement ApplyGraphPlan, DeleteBatch, Count, SawRows or GetExactBatch -- only
+// BdStore, NativeDoltStore and CachingStore implement any of them, and none of
 // those are reachable from a cheap, hermetic unit test through the real
 // openStoreAtForCity factory (it has no seam to inject a fake backing store,
 // and the native/bd providers require a real preflight-gated store). A
@@ -45,6 +46,8 @@ type fullyCapableBackingStore struct {
 	countCalls       int
 	countErr         error
 	sawRows          bool
+	exactBatchIDs    []string
+	exactBatchErr    error
 }
 
 func (s *fullyCapableBackingStore) ApplyGraphPlan(_ context.Context, plan *beads.GraphApplyPlan) (*beads.GraphApplyResult, error) {
@@ -66,6 +69,14 @@ func (s *fullyCapableBackingStore) SawRows() bool {
 	return s.sawRows
 }
 
+func (s *fullyCapableBackingStore) GetExactBatch(ids []string) (map[string]beads.Bead, []string, error) {
+	s.exactBatchIDs = append(s.exactBatchIDs, ids...)
+	if len(ids) == 0 {
+		return map[string]beads.Bead{}, nil, s.exactBatchErr
+	}
+	return map[string]beads.Bead{ids[0]: {ID: ids[0]}}, ids[1:], s.exactBatchErr
+}
+
 func (s *fullyCapableBackingStore) ReadyContext(ctx context.Context, query ...beads.ReadyQuery) ([]beads.Bead, error) {
 	reader, ok := s.Store.(beads.ContextReadyReader)
 	if !ok {
@@ -75,12 +86,12 @@ func (s *fullyCapableBackingStore) ReadyContext(ctx context.Context, query ...be
 }
 
 // TestRouteClearForwardsOptionalCapabilitiesThroughProductionComposition
-// composes a store exactly the way openStoreAtForCityWithConfig does at
-// cmd/gc/main.go:1698-1701 -- wrapStoreWithBeadPolicies, then
+// composes a store exactly the way openStoreAtForCityWithConfig does
+// (cmd/gc/main.go) -- wrapStoreWithBeadPolicies, then
 // beads.WithRouteChangeClearing on top -- and asserts that
 // beads.GraphApplyFor, beads.HandlesFor (tier expansion), beads.Counter,
-// beads.BatchDeleter and beads.RowWitness all still resolve through the
-// outermost (route-clear) wrapper.
+// beads.BatchDeleter, beads.RowWitness and beads.ExactBatchGetter all still
+// resolve through the outermost (route-clear) wrapper.
 //
 // Per ga-8q8z2w: routeChangeClearingStore embeds the Store INTERFACE, so it
 // only promotes the capabilities it re-declares -- every one of these is
@@ -179,6 +190,122 @@ func TestRouteClearForwardsOptionalCapabilitiesThroughProductionComposition(t *t
 		}
 		if _, err := reader.ReadyContext(context.Background()); err != nil {
 			t.Fatalf("ReadyContext: %v", err)
+		}
+	})
+
+	t.Run("ExactBatchGetter", func(t *testing.T) {
+		getter, ok := store.(beads.ExactBatchGetter)
+		if !ok {
+			t.Fatal("store.(beads.ExactBatchGetter) ok = false, want true: route-clear-wrapped store does not resolve ExactBatchGetter, so the gc bd bulk-mutation guard reads one bead per id instead of one batch")
+		}
+		found, unresolved, err := getter.GetExactBatch([]string{"bead-1", "bead-2"})
+		if err != nil {
+			t.Fatalf("GetExactBatch: %v", err)
+		}
+		if _, ok := found["bead-1"]; !ok || len(found) != 1 {
+			t.Fatalf("found = %v, want exactly bead-1 (forwarded from backing store)", found)
+		}
+		if len(unresolved) != 1 || unresolved[0] != "bead-2" {
+			t.Fatalf("unresolved = %v, want [bead-2] (forwarded from backing store)", unresolved)
+		}
+		if len(backing.exactBatchIDs) != 2 {
+			t.Fatalf("backing.exactBatchIDs = %v, want 2 forwarded IDs", backing.exactBatchIDs)
+		}
+
+		// A backing failure must reach the caller unchanged: the gc bd guard
+		// takes the per-id path on ANY batch error, which only works if the
+		// forward neither swallows nor rewrites it.
+		errBatch := errors.New("bd show failed")
+		backing.exactBatchErr = errBatch
+		if _, _, err := getter.GetExactBatch([]string{"bead-3"}); !errors.Is(err, errBatch) {
+			t.Fatalf("GetExactBatch error = %v, want the backing store's error forwarded", err)
+		}
+	})
+}
+
+// TestRouteClearExactBatchWithoutBackingSupportReportsUnsupported pins the miss
+// shape of the exact batch forward. A backing store with no exact batch read
+// must answer beads.ErrExactBatchGetUnsupported -- the sentinel the gc bd
+// mutation guard falls back to a per-id Get on -- rather than an empty, successful
+// read that would make every requested id look absent.
+func TestRouteClearExactBatchWithoutBackingSupportReportsUnsupported(t *testing.T) {
+	store := beads.WithRouteChangeClearing(beads.NewMemStore(), func(target string) string { return target })
+
+	getter, ok := store.(beads.ExactBatchGetter)
+	if !ok {
+		t.Fatal("store.(beads.ExactBatchGetter) ok = false, want true: the decorator must always answer the capability so a miss is explicit")
+	}
+	if _, _, err := getter.GetExactBatch([]string{"bead-1", "bead-2"}); !errors.Is(err, beads.ErrExactBatchGetUnsupported) {
+		t.Fatalf("GetExactBatch error = %v, want errors.Is(err, beads.ErrExactBatchGetUnsupported)", err)
+	}
+}
+
+// TestRouteClearCarriesTheProxiedStoreView pins the beads.ProxiedStoreCarrier
+// seam (internal/beads/proxied_store_view.go) through route_clear_store.go.
+//
+// internal/doctor and beads.LiveProxiedDiagnostic ask a store whether the split
+// store underneath it is still serving natively or has stood down, through
+// beads.ProxiedStoreFrom. That walk only knows the wrappers it is told about and
+// anything that declares ProxiedStore(); routeChangeClearingStore embeds the
+// Store INTERFACE, so it promotes nothing outside that interface. It is also the
+// OUTERMOST wrapper on every CLI/standalone open (cmd/gc/main.go composes
+// wrapStoreWithBeadPolicies, then beads.WithRouteChangeClearing), which makes it
+// the first thing the walk meets. Without a forward, a proxied city's CLI handle
+// answers "not a split store" and `gc doctor` keeps reporting the account
+// recorded at open for a handle that has since stood down -- the same defect
+// class as ga-8q8z2w, one optional capability later.
+func TestRouteClearCarriesTheProxiedStoreView(t *testing.T) {
+	identity := func(target string) string { return target }
+
+	t.Run("ThroughProductionComposition", func(t *testing.T) {
+		view := &fakeProxiedStore{bdLeaf: beads.NewMemStore()}
+		store := beads.WithRouteChangeClearing(
+			wrapStoreWithBeadPolicies(beads.NewCachingStoreForTest(view, nil), &config.City{}),
+			identity,
+		)
+
+		carried, ok := beads.ProxiedStoreFrom(store)
+		if !ok {
+			t.Fatal("ProxiedStoreFrom(routeClear(policy(cache(proxied)))) ok = false, want true: the outermost wrapper hides the split store")
+		}
+		if any(carried) != any(view) {
+			t.Fatalf("carried view = %T %p, want the split store underneath (%p): a copy would stop tracking its stand-down", carried, carried, view)
+		}
+
+		// The view is live, not a snapshot: a stand-down AFTER the handle was
+		// opened must show through the decorator, which is the one thing
+		// `gc doctor` exists to tell an operator about a degraded city.
+		if carried.Demoted() {
+			t.Fatal("carried view reports demoted while the native leaf is serving")
+		}
+		view.demoted = true
+		if !carried.Demoted() {
+			t.Fatal("carried view did not observe the stand-down of the store underneath it")
+		}
+	})
+
+	t.Run("LiveProxiedDiagnosticReachesTheSplitStore", func(t *testing.T) {
+		view := &fakeProxiedStore{
+			demoted: true,
+			bdLeaf:  beads.NewMemStore(),
+			report:  beads.ProxiedOpenReport{Demoted: true},
+		}
+		store := beads.WithRouteChangeClearing(wrapStoreWithBeadPolicies(view, &config.City{}), identity)
+
+		got := beads.LiveProxiedDiagnostic(store, nil)
+		if got == nil {
+			t.Fatal("LiveProxiedDiagnostic(routeClear(policy(proxied)), nil) = nil, want the live account: the decorator hides the split store from the doctor's projection")
+		}
+		if !got.Demoted {
+			t.Fatal("LiveProxiedDiagnostic did not carry the live demoted account through the decorator")
+		}
+	})
+
+	t.Run("NonProxiedStoreStillAnswersFalse", func(t *testing.T) {
+		store := beads.WithRouteChangeClearing(wrapStoreWithBeadPolicies(beads.NewMemStore(), &config.City{}), identity)
+
+		if view, ok := beads.ProxiedStoreFrom(store); ok {
+			t.Fatalf("a route-clear-wrapped MemStore answered as a proxied store: %T", view)
 		}
 	})
 }
