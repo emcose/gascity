@@ -1,6 +1,7 @@
 package scripts_test
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -112,6 +113,24 @@ func (f *prePushFixture) gitOut(t *testing.T, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
+// commit writes files (repo-relative, parent directories created) on top of
+// HEAD and returns the new commit.
+func (f *prePushFixture) commit(t *testing.T, message string, files map[string]string) string {
+	t.Helper()
+	for rel, body := range files {
+		path := filepath.Join(f.repo, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir for %s: %v", rel, err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+	}
+	f.git(t, "add", "-A")
+	f.git(t, "commit", "-q", "--no-verify", "-m", message)
+	return f.gitOut(t, "rev-parse", "HEAD")
+}
+
 // run invokes the fixture's pre-push hook with the given ref lines on stdin.
 func (f *prePushFixture) run(t *testing.T, stdin string) (int, string) {
 	t.Helper()
@@ -217,5 +236,74 @@ exit 9
 	}
 	if got := f.read(t, f.makeRuns); got != "" {
 		t.Fatalf("push-time suite ran after a beads rejection: %q", got)
+	}
+}
+
+// TestPrePushSkipsSuiteWhenNoGoFileChanged pins the saving the scan exists
+// for: updating a branch without touching a Go file must not run the suite.
+func TestPrePushSkipsSuiteWhenNoGoFileChanged(t *testing.T) {
+	f := newPrePushFixture(t)
+	docsOnly := f.commit(t, "docs only", map[string]string{"README.md": "fixture, revised\n"})
+	refLine := "refs/heads/main " + docsOnly + " refs/heads/main " + f.commitNew + "\n"
+
+	code, out := f.run(t, refLine)
+	if code != 0 {
+		t.Fatalf("pre-push exit = %d, want 0\n%s", code, out)
+	}
+	if got := f.read(t, f.makeRuns); got != "" {
+		t.Fatalf("push-time suite ran for a push that changes no Go file: %q", got)
+	}
+}
+
+// TestPrePushRunsSuiteForLargeGoDiff is the regression test for #6866. The
+// scan used to pipe `git diff --name-only` into `grep -q .` under pipefail:
+// grep exits on its first match, git dies of SIGPIPE on its next write, and
+// the pipeline's 141 read as "no Go change". Any diff whose name list outgrew
+// the pipe buffer — merging main into an old branch, a wide refactor —
+// skipped the suite.
+func TestPrePushRunsSuiteForLargeGoDiff(t *testing.T) {
+	f := newPrePushFixture(t)
+	// Long directory names push the name list far past the pipe buffer
+	// (64 KiB on Linux) without paying for thousands of files.
+	dir := filepath.Join("pkg", strings.Repeat("d", 200), strings.Repeat("e", 200))
+	files := make(map[string]string, 1024)
+	for i := range 1024 {
+		files[filepath.Join(dir, fmt.Sprintf("f%04d.go", i))] = "package fixture\n"
+	}
+	wide := f.commit(t, "wide Go change", files)
+	// Below a few pipe buffers git can finish writing before grep exits, and
+	// this test would pass against the old pipeline by luck.
+	if names := f.gitOut(t, "diff", "--name-only", f.commitNew, wide, "--", "*.go"); len(names) < 256<<10 {
+		t.Fatalf("fixture Go name list is %d bytes; it must exceed 256 KiB to overflow the pipe", len(names))
+	}
+	refLine := "refs/heads/main " + wide + " refs/heads/main " + f.commitNew + "\n"
+
+	code, out := f.run(t, refLine)
+	if code != 0 {
+		t.Fatalf("pre-push exit = %d, want 0\n%s", code, out)
+	}
+	if got := f.read(t, f.makeRuns); !strings.Contains(got, "test-fast-parallel") {
+		t.Fatalf("push-time suite skipped for a %d-file Go diff (make invocations = %q)", len(files), got)
+	}
+}
+
+// TestPrePushRunsSuiteWhenRemoteTipIsUnknown covers the scan's other fail-open:
+// git cannot diff against a remote tip this clone never fetched. A force push
+// over that tip still lands, so, as for a new branch, there is no base to
+// trust — the suite runs, and the hook says why instead of skipping silently.
+func TestPrePushRunsSuiteWhenRemoteTipIsUnknown(t *testing.T) {
+	f := newPrePushFixture(t)
+	unfetched := strings.Repeat("ab", 20)
+	refLine := "refs/heads/main " + f.commitNew + " refs/heads/main " + unfetched + "\n"
+
+	code, out := f.run(t, refLine)
+	if code != 0 {
+		t.Fatalf("pre-push exit = %d, want 0\n%s", code, out)
+	}
+	if got := f.read(t, f.makeRuns); !strings.Contains(got, "test-fast-parallel") {
+		t.Fatalf("push-time suite skipped although remote tip %s could not be diffed (make invocations = %q)", unfetched, got)
+	}
+	if !strings.Contains(out, "pre-push: cannot diff") {
+		t.Fatalf("hook ran the suite without saying why:\n%s", out)
 	}
 }

@@ -44,9 +44,23 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
     go_changed=1
     continue
   fi
-  if git diff --name-only "$remote_sha" "$local_sha" -- '*.go' 2>/dev/null | grep -q .; then
-    go_changed=1
-  fi
+  # git answers through its exit status: 0 = no Go change, 1 = Go changed.
+  # Never pipe `--name-only` into `grep -q .` here (#6866): grep exits on its
+  # first match, git dies of SIGPIPE on its next write, and pipefail turns
+  # that into "no change" for exactly the large diffs that most need the suite.
+  diff_rc=0
+  git diff --quiet "$remote_sha" "$local_sha" -- '*.go' || diff_rc=$?
+  case "$diff_rc" in
+    0) ;;
+    1) go_changed=1 ;;
+    *)
+      # git could not diff at all, typically because remote_sha is a commit
+      # this clone never fetched. A force push over it still lands, so treat
+      # it like a new branch: no base to trust — run the suite.
+      echo "pre-push: cannot diff against remote tip $remote_sha (not fetched here?); running the suite" >&2
+      go_changed=1
+      ;;
+  esac
 done < <(replay_refs)
 
 # Bead ownership/staleness guard (ga-fip9ps.1): re-checks bd claim state
