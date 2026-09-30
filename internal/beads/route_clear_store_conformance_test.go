@@ -152,22 +152,22 @@ var routedToAllowlist = []routedToSite{
 	// WithRouteChangeClearing wrapped in during the GREEN phase. ---
 	{
 		path:   "cmd/gc/build_desired_state.go",
-		line:   5359,
+		line:   5563,
 		reason: "write to a pre-existing bead (canonicalize routed_to spelling on assignee-change repair pass); Root #5 (build_desired_state.go reconciliation loop) -- wrap that root's store construction in GREEN phase",
 	},
 	{
 		path:   "cmd/gc/build_desired_state.go",
-		line:   5419,
+		line:   5623,
 		reason: "write to a pre-existing bead (canonicalizeLegacyBoundUnassignedRoutedWork); Root #5 (build_desired_state.go reconciliation loop) -- wrap that root's store construction in GREEN phase",
 	},
 	{
 		path:   "cmd/gc/build_desired_state.go",
-		line:   6227,
+		line:   6434,
 		reason: "write to a pre-existing bead (controlDispatcherRouteRepair.persist, repairControlDispatcherRoutesForStoreScope); Root #5 (build_desired_state.go reconciliation loop) -- wrap that root's store construction in GREEN phase",
 	},
 	{
 		path:   "cmd/gc/build_desired_state.go",
-		line:   6254,
+		line:   6461,
 		reason: "in-memory mirror of the line-6210 persisted write (applyRouteRepairInMemory), applied only after the durable write at line 6210 already succeeded; same Root #5 -- wrap that root's store construction in GREEN phase",
 	},
 	{
@@ -182,7 +182,7 @@ var routedToAllowlist = []routedToSite{
 	},
 	{
 		path:   "cmd/gc/cmd_sling.go",
-		line:   770,
+		line:   771,
 		reason: "write to a pre-existing bead; Root #3 (cmd_sling.go slingDeps.Store) -- wrap that root's store construction in GREEN phase",
 	},
 	{
@@ -202,7 +202,7 @@ var routedToAllowlist = []routedToSite{
 	},
 	{
 		path:   "internal/api/handler_sling.go",
-		line:   534,
+		line:   541,
 		reason: "write to a pre-existing bead; Root #4 (internal/api/handler_sling.go:534, API sling composition root per design sec 15) -- wrap that root's store construction in GREEN phase",
 	},
 
@@ -241,7 +241,7 @@ var routedToAllowlist = []routedToSite{
 	},
 	{
 		path:   "cmd/gc/route_recovery_lane.go",
-		line:   859,
+		line:   896,
 		reason: "write to a pre-existing, long-lived, flap-tracked bead (routeRecoveryLane restore path, via SetMetadataBatch); resolves to Root #1 (controller-managed) or Root #7 (standalone), not an independent root -- see block comment above; wrap those roots in GREEN phase",
 	},
 
@@ -262,22 +262,22 @@ var routedToAllowlist = []routedToSite{
 	},
 	{
 		path:   "cmd/gc/order_dispatch.go",
-		line:   2411,
+		line:   2433,
 		reason: "creation-time-only: identical fresh-creation labeling pattern to cmd_order.go:903 -- no prior stamps possible",
 	},
 	{
 		path:   "internal/dispatch/control.go",
-		line:   1321,
+		line:   1339,
 		reason: "creation-time-only: applyAttemptStepRoute mutates *formula.RecipeStep.Metadata in-memory before molecule.Attach creates the retry-attempt bead (spawnNextAttempt) -- no prior bead exists yet",
 	},
 	{
 		path:   "internal/dispatch/control.go",
-		line:   1348,
+		line:   1366,
 		reason: "creation-time-only: same applyAttemptStepRoute pattern as line 1313 -- mutates *formula.RecipeStep.Metadata before molecule.Attach -- no prior bead exists yet",
 	},
 	{
 		path:   "internal/dispatch/control.go",
-		line:   1390,
+		line:   1408,
 		reason: "creation-time-only: applyAttemptControlStepRoute mutates *formula.RecipeStep.Metadata before molecule.Attach -- no prior bead exists yet",
 	},
 	{
