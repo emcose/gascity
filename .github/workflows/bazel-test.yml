@@ -2,9 +2,11 @@
 # the Bazel arm against the same commit so drift is caught early.
 #
 # Execution mode is env-driven:
-#   BAZEL_REMOTE_EXECUTOR  remote execution endpoint (grpc://...). Unset = local
-#                 execution only (no remote cache/exec), which keeps this
-#                 job green on fork PRs without farm access.
+#   BAZEL_REMOTE_EXECUTOR  remote execution endpoint (grpc://...). Unset (fork
+#                 PRs, no secrets; rbe=cache/off dispatches) = local execution
+#                 with lookups in rbe-west's anonymous read-only cache
+#                 (.bazelrc `fork-cache`; misses run here, nothing is
+#                 uploaded), or with no remote at all for rbe=off.
 #   RBE_TLS_CERT / RBE_TLS_KEY / RBE_TLS_CA
 #                 client certificate for mTLS endpoints (optional, base64).
 #   RBE_INSTANCE  RE instance name (optional, default empty).
@@ -26,6 +28,12 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      rbe:
+        description: "on: remote execution (secrets); cache: fork simulation (anonymous read-only cache); off: local only"
+        type: choice
+        default: "on"
+        options: ["on", "cache", "off"]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -43,15 +51,18 @@ jobs:
       contents: read
       actions: write # dispatch rbe-worker-pool.yml (pre-warm)
     env:
-      # Hoisted so the step-level `if:` below can see it (empty on forks,
-      # where secrets are unavailable — the job then runs locally).
-      BAZEL_REMOTE_EXECUTOR: ${{ (vars.RBE_WEST_WORKERS == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && secrets.RBE_WEST_EXECUTOR || secrets.BAZEL_REMOTE_EXECUTOR }}
+      # Hoisted so the step-level `if:` below can see it. Empty for forks
+      # (no secrets) and for rbe=cache/off dispatches: the job then runs
+      # locally.
+      BAZEL_REMOTE_EXECUTOR: ${{ inputs.rbe != 'cache' && inputs.rbe != 'off' && ((vars.RBE_WEST_WORKERS == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && secrets.RBE_WEST_EXECUTOR || secrets.BAZEL_REMOTE_EXECUTOR) || '' }}
       RBE_INSTANCE_OVERRIDE: ${{ (vars.RBE_WEST_WORKERS == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && 'oss' || '' }}
+      # Without an executor: rbe-west's anonymous read-only cache, unless rbe=off.
+      BAZEL_FORK_CACHE: ${{ inputs.rbe != 'off' && 'true' || '' }}
     steps:
       # Best effort: a worker boots (~30 s) while this job checks out and
       # analyzes. The rbe-west scaler covers anything beyond one worker.
       - name: Pre-warm the OSS worker pool (rbe-west)
-        if: vars.RBE_WEST_WORKERS == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        if: env.BAZEL_REMOTE_EXECUTOR != '' && vars.RBE_WEST_WORKERS == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         env:
           GH_TOKEN: ${{ github.token }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
@@ -133,6 +144,27 @@ jobs:
             echo 'build --jobs=64'
           } > .bazelrc.local
 
+      # Forks (no secrets): the same lines as the remote branch above minus
+      # build:remote-exec, so fork actions hash like trusted ones (the
+      # explicit test PATH is the key input; .bazelrc's bare --test_env=PATH
+      # would forward the runner's) and hit what trusted CI executed; lookups
+      # go to the anonymous read-only cache and misses run here. Tests run
+      # locally with that PATH, so give them the Go the remote workers have
+      # at /usr/local/go.
+      - name: Configure read-only fork cache (no secrets)
+        if: env.BAZEL_REMOTE_EXECUTOR == '' && env.BAZEL_FORK_CACHE == 'true'
+        run: |
+          if [ ! -e /usr/local/go ]; then
+            sudo ln -s "$(go env GOROOT)" /usr/local/go
+          elif [ ! -x /usr/local/go/bin/go ]; then
+            echo "::warning::/usr/local/go exists without bin/go; tests that exec go may fail"
+          fi
+          {
+            echo 'build --remote_download_minimal'
+            echo 'test --test_env=PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin'
+            echo 'build --jobs=64'
+            echo 'build --config=fork-cache'
+          } > .bazelrc.local
 
       - name: Create Bazel test tmpdir
         run: |
@@ -159,7 +191,10 @@ jobs:
           # data deps, so workers need no network or system bd.
           # --test_timeout stays at or below 1100s: the scheduler caps action
           # timeouts at 1200s and rejects anything larger as NO STATUS.
-          if [ -f .bazelrc.local ]; then
+          # --config=remote-exec only with an executor: its --remote_timeout=3600
+          # would otherwise override fork-cache's 60s (.bazelrc.local applies
+          # fork-cache for forks).
+          if [ -n "$BAZEL_REMOTE_EXECUTOR" ]; then
             RCEXEC=(--config=remote-exec)
           else
             RCEXEC=()
@@ -187,7 +222,7 @@ jobs:
         if: always()
         run: |
           ARGS=(--output_user_root="$RUNNER_TEMP"/bazel-outputs)
-          if [ -f .bazelrc.local ]; then RCEXEC=(--config=remote-exec); else RCEXEC=(); fi
+          if [ -n "$BAZEL_REMOTE_EXECUTOR" ]; then RCEXEC=(--config=remote-exec); else RCEXEC=(); fi
           bazel "${ARGS[@]}" test //test/integration:integration_test \
             "${RCEXEC[@]}" --test_output=errors --keep_going \
             --define=gotags=integration --test_timeout=1100 --flaky_test_attempts=1 || true
@@ -205,7 +240,7 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           ARGS=(--output_user_root="$RUNNER_TEMP"/bazel-outputs)
-          if [ -f .bazelrc.local ]; then RCEXEC=(--config=remote-exec); else RCEXEC=(); fi
+          if [ -n "$BAZEL_REMOTE_EXECUTOR" ]; then RCEXEC=(--config=remote-exec); else RCEXEC=(); fi
           bazel "${ARGS[@]}" coverage //... \
             "${RCEXEC[@]}" --combined_report=lcov \
             --test_output=errors --keep_going --test_timeout=600
