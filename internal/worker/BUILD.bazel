@@ -62,6 +62,7 @@ go_test(
         "handle_stop_intent_test.go",
         "handle_test.go",
         "handle_transcriptmeta_test.go",
+        "invocation_telemetry_identity_test.go",
         "invocation_telemetry_label_test.go",
         "invocation_telemetry_recording_test.go",
         "invocation_telemetry_test.go",

@@ -17,6 +17,7 @@ go_test(
     name = "usage_test",
     srcs = [
         "exec_sink_test.go",
+        "identity_migration_test.go",
         "local_sink_test.go",
         "recent_reader_test.go",
         "testenv_import_test.go",
